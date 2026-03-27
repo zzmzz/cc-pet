@@ -1,0 +1,21 @@
+# Python (legacy)
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.spec
+.env
+
+# Node
+node_modules/
+dist/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# Build
+build/
+
+# Config (contains tokens)
+config.toml
+*.session

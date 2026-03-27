@@ -1,0 +1,384 @@
+import { useEffect, useRef, useCallback, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useAppStore } from "@/lib/store";
+import { sendMessage, sendFile, clearHistory } from "@/lib/commands";
+import { open } from "@tauri-apps/plugin-dialog";
+import type { ChatMessage } from "@/lib/types";
+
+function MessageBubble({ msg }: { msg: ChatMessage }) {
+  const isUser = msg.role === "user";
+
+  if (msg.contentType === "file") {
+    return (
+      <div
+        className={`flex ${isUser ? "justify-end" : "justify-start"} px-3 py-1`}
+      >
+        <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 text-blue-700 text-sm flex items-center gap-2 max-w-[80%]">
+          <span>📎</span>
+          <span className="truncate">{msg.filePath || msg.content}</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (msg.contentType === "image") {
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 10, scale: 0.97 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        transition={{ duration: 0.2 }}
+        className={`flex ${isUser ? "justify-end" : "justify-start"} px-3 py-1`}
+      >
+        <div className="max-w-[85%] rounded-2xl px-4 py-2.5 bg-gray-100 text-gray-800 rounded-bl-md">
+          <img
+            src={msg.content}
+            alt="Generated"
+            className="rounded-lg max-w-full max-h-80 object-contain"
+            loading="lazy"
+          />
+          <div className="text-[10px] mt-1 text-gray-400">
+            {new Date(msg.timestamp).toLocaleTimeString("zh-CN", {
+              hour: "2-digit",
+              minute: "2-digit",
+            })}
+          </div>
+        </div>
+      </motion.div>
+    );
+  }
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10, scale: 0.97 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      transition={{ duration: 0.2 }}
+      className={`flex ${isUser ? "justify-end" : "justify-start"} px-3 py-1`}
+    >
+      <div
+        className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-[13.5px] leading-relaxed ${
+          isUser
+            ? "bg-indigo-500 text-white rounded-br-md"
+            : "bg-gray-100 text-gray-800 rounded-bl-md markdown-body"
+        }`}
+      >
+        {isUser ? (
+          <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+        ) : (
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            rehypePlugins={[rehypeRaw]}
+            components={{
+              code({ className, children, ...props }) {
+                const match = /language-(\w+)/.exec(className || "");
+                const codeStr = String(children).replace(/\n$/, "");
+                if (match) {
+                  return (
+                    <SyntaxHighlighter
+                      style={oneDark}
+                      language={match[1]}
+                      PreTag="div"
+                      customStyle={{
+                        borderRadius: "8px",
+                        margin: "6px 0",
+                        fontSize: "12.5px",
+                      }}
+                    >
+                      {codeStr}
+                    </SyntaxHighlighter>
+                  );
+                }
+                return (
+                  <code
+                    className="bg-slate-100 text-rose-600 px-1.5 py-0.5 rounded text-[0.9em]"
+                    {...props}
+                  >
+                    {children}
+                  </code>
+                );
+              },
+              a({ href, children }) {
+                return (
+                  <a
+                    href={href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-600 hover:underline"
+                  >
+                    {children}
+                  </a>
+                );
+              },
+            }}
+          >
+            {msg.content}
+          </ReactMarkdown>
+        )}
+        <div
+          className={`text-[10px] mt-1 ${
+            isUser ? "text-indigo-200" : "text-gray-400"
+          }`}
+        >
+          {new Date(msg.timestamp).toLocaleTimeString("zh-CN", {
+            hour: "2-digit",
+            minute: "2-digit",
+          })}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
+  const {
+    messages,
+    chatOpen,
+    setChatOpen,
+    setSettingsOpen,
+    connected,
+    addMessage,
+    updateMessage,
+    setPetState,
+  } = useAppStore();
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const [input, setInput] = useState("");
+  const bridgeStreamBotIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    if (chatOpen) inputRef.current?.focus();
+  }, [chatOpen]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const unlistenFns: Array<() => void> = [];
+
+    async function setup() {
+      const u3 = await listen<string>("bridge-stream-delta", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const delta = e.payload;
+        let id = bridgeStreamBotIdRef.current;
+        if (!id) {
+          id = `bot-bridge-${Date.now()}`;
+          bridgeStreamBotIdRef.current = id;
+          store.addMessage({
+            id,
+            role: "bot",
+            content: delta,
+            contentType: "text",
+            timestamp: Date.now(),
+          });
+          store.setPetState("talking");
+        } else {
+          const prev =
+            store.messages.find((m) => m.id === id)?.content || "";
+          store.updateMessage(id, { content: prev + delta });
+        }
+      });
+      if (cancelled) { u3(); return; }
+      unlistenFns.push(u3);
+
+      const u4 = await listen<string>("bridge-stream-done", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const full = e.payload;
+        const id = bridgeStreamBotIdRef.current;
+        if (id) {
+          if (full.length > 0) {
+            store.updateMessage(id, { content: full });
+          }
+          bridgeStreamBotIdRef.current = null;
+        } else if (full.length > 0) {
+          store.addMessage({
+            id: `bot-${Date.now()}`,
+            role: "bot",
+            content: full,
+            contentType: "text",
+            timestamp: Date.now(),
+          });
+        } else {
+          bridgeStreamBotIdRef.current = null;
+        }
+        store.setPetState("idle");
+      });
+      if (cancelled) { u4(); return; }
+      unlistenFns.push(u4);
+    }
+
+    setup();
+
+    return () => {
+      cancelled = true;
+      unlistenFns.forEach((fn) => fn());
+    };
+  }, []);
+
+  const handleSend = useCallback(async () => {
+    const text = input.trim();
+    if (!text) return;
+    setInput("");
+
+    const userMsg: ChatMessage = {
+      id: `user-${Date.now()}`,
+      role: "user",
+      content: text,
+      contentType: "text",
+      timestamp: Date.now(),
+    };
+    addMessage(userMsg);
+
+    setPetState("thinking");
+    try {
+      await sendMessage(text);
+    } catch (e) {
+      console.error("send failed:", e);
+      setPetState("error");
+      setTimeout(() => setPetState("idle"), 3000);
+    }
+  }, [input, addMessage, setPetState]);
+
+  const handleAttach = useCallback(async () => {
+    const selected = await open({ multiple: false });
+    if (selected) {
+      const path = typeof selected === "string" ? selected : selected;
+      addMessage({
+        id: `file-${Date.now()}`,
+        role: "user",
+        content: String(path).split("/").pop() || "file",
+        contentType: "file",
+        filePath: String(path),
+        timestamp: Date.now(),
+      });
+      try {
+        await sendFile(String(path));
+      } catch (e) {
+        console.error("send file failed:", e);
+      }
+    }
+  }, [addMessage]);
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        handleSend();
+      }
+      if (e.key === "Escape") {
+        setChatOpen(false);
+      }
+    },
+    [handleSend, setChatOpen]
+  );
+
+  const isConnected = connected;
+
+  return (
+    <AnimatePresence>
+      {chatOpen && (
+        <motion.div
+          initial={{ opacity: 0, scale: 0.9, y: 20 }}
+          animate={{ opacity: 1, scale: 1, y: 0 }}
+          exit={{ opacity: 0, scale: 0.9, y: 20 }}
+          transition={{ type: "spring", damping: 25, stiffness: 300 }}
+          className="absolute inset-0 flex flex-col bg-white/[0.97] backdrop-blur-sm rounded-2xl border border-gray-200 shadow-2xl overflow-hidden z-10"
+        >
+          {/* Title bar */}
+          <div
+            className="flex items-center h-11 px-4 border-b border-gray-100 shrink-0 cursor-grab active:cursor-grabbing"
+            onMouseDown={(e) => {
+              if (e.button !== 0) return;
+              const target = e.target as HTMLElement;
+              if (target.closest("button") || target.closest("input") || target.closest("textarea")) return;
+              e.preventDefault();
+              getCurrentWindow().startDragging().catch(console.error);
+            }}
+            data-tauri-drag-region
+          >
+            <span className="font-bold text-gray-800 text-sm">CC Pet</span>
+            <span
+              className={`ml-2 w-2 h-2 rounded-full ${
+                isConnected ? "bg-green-500" : "bg-red-400"
+              }`}
+            />
+            <span className="ml-1.5 text-[11px] text-gray-400">
+              {isConnected ? "已连接" : "未连接"}
+            </span>
+            <div className="flex-1" data-tauri-drag-region />
+            <button
+              onClick={() => setSettingsOpen(true)}
+              className="text-[11px] text-gray-400 hover:text-indigo-500 transition-colors mr-2"
+            >
+              设置
+            </button>
+            <button
+              onClick={() => clearHistory()}
+              className="text-[11px] text-gray-400 hover:text-red-500 transition-colors mr-2"
+            >
+              清空
+            </button>
+            <button
+              onClick={() => setChatOpen(false)}
+              className="text-gray-400 hover:text-gray-600 transition-colors text-lg leading-none"
+            >
+              ✕
+            </button>
+          </div>
+
+          {/* Messages */}
+          <div ref={scrollRef} className="flex-1 overflow-y-auto py-3 space-y-1">
+            {messages.length === 0 && (
+              <div className="flex items-center justify-center h-full text-gray-300 text-sm">
+                双击宠物开始聊天
+              </div>
+            )}
+            {messages.map((msg) => (
+              <MessageBubble key={msg.id} msg={msg} />
+            ))}
+          </div>
+
+          {/* Input — left padding reserves space for the pet in the corner */}
+          <div className="border-t border-gray-100 p-3 shrink-0" style={{ paddingLeft: petSize + 8 }}>
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="输入消息，Ctrl+Enter 发送…"
+              className="w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-4 py-2.5 text-[13.5px] outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 transition-all placeholder:text-gray-400"
+              rows={3}
+            />
+            <div className="flex items-center mt-2">
+              <button
+                onClick={handleAttach}
+                className="text-sm text-gray-500 hover:text-gray-700 border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50 transition-colors"
+              >
+                📎 文件
+              </button>
+              <div className="flex-1" />
+              <button
+                onClick={handleSend}
+                disabled={!input.trim()}
+                className="bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg px-5 py-1.5 transition-colors"
+              >
+                发送
+              </button>
+            </div>
+          </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}

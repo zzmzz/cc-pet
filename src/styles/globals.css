@@ -1,0 +1,102 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --accent: 99 102 241;
+  --bg-primary: 255 255 255;
+  --bg-secondary: 249 250 251;
+  --text-primary: 17 24 39;
+  --text-secondary: 107 114 128;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  background: transparent !important;
+}
+
+body {
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI",
+    Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(var(--text-secondary), 0.3);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(var(--text-secondary), 0.5);
+}
+
+/* Markdown code blocks */
+.markdown-body pre {
+  background: #1e1e2e;
+  border-radius: 8px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  margin: 6px 0;
+}
+.markdown-body code {
+  font-family: "JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas,
+    monospace;
+  font-size: 12.5px;
+}
+.markdown-body p code {
+  background: #f1f5f9;
+  color: #e11d48;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+.markdown-body table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 8px 0;
+}
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid #e5e7eb;
+  padding: 6px 10px;
+  text-align: left;
+  font-size: 13px;
+}
+.markdown-body th {
+  background: #f9fafb;
+  font-weight: 600;
+}
+.markdown-body blockquote {
+  border-left: 3px solid rgb(var(--accent));
+  margin: 6px 0;
+  padding: 4px 12px;
+  color: #4b5563;
+  background: #f5f3ff;
+  border-radius: 0 6px 6px 0;
+}
+.markdown-body img {
+  max-width: 100%;
+  border-radius: 6px;
+}
+.markdown-body a {
+  color: #2563eb;
+  text-decoration: none;
+}
+.markdown-body a:hover {
+  text-decoration: underline;
+}
