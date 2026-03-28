@@ -1,0 +1,23 @@
+---
+description: 打 git tag 时必须同步更新所有版本号文件
+alwaysApply: true
+---
+
+# 版本号同步规则
+
+打 git tag 发布新版本时，**必须先更新以下三个文件中的版本号**，然后提交，最后在该提交上打 tag：
+
+1. `package.json` → `"version": "x.y.z"`
+2. `src-tauri/Cargo.toml` → `version = "x.y.z"`
+3. `src-tauri/tauri.conf.json` → `"version": "x.y.z"`
+
+## 正确流程
+
+```
+1. 更新三个文件的版本号（不带 v 前缀）
+2. git add + git commit -m "chore: bump version to x.y.z"
+3. git tag -a vx.y.z -m "版本说明"
+4. git push origin main; git push origin vx.y.z
+```
+
+**禁止先打 tag 再改版本号**——tag 必须指向已包含正确版本号的提交。
