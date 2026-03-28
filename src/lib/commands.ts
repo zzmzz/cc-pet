@@ -6,6 +6,7 @@ import type {
   UpdateCheckResult,
   ConnectionStatus,
   BridgeSessionsData,
+  LocalSessionsData,
 } from "./types";
 
 export async function loadConfig(): Promise<AppConfig> {
@@ -30,6 +31,18 @@ export async function getBridgeStatus(): Promise<ConnectionStatus[]> {
 
 export async function listBridgeSessions(connectionId: string): Promise<BridgeSessionsData> {
   return invoke("list_bridge_sessions", { connectionId });
+}
+
+export async function listLocalSessions(connectionId: string): Promise<LocalSessionsData> {
+  return invoke("list_local_sessions", { connectionId });
+}
+
+export async function updateSessionLabel(
+  connectionId: string,
+  sessionId: string,
+  label: string,
+): Promise<void> {
+  return invoke("update_session_label", { connectionId, sessionId, label });
 }
 
 export async function createBridgeSession(

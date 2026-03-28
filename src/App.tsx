@@ -13,6 +13,8 @@ import {
   connectBridge,
   getBridgeStatus,
   setMainWindowSize,
+  listLocalSessions,
+  getHistory,
 } from "@/lib/commands";
 
 let hasInitializedApp = false;
@@ -24,6 +26,10 @@ export default function App() {
     setConnections,
     setConnectionStatus,
     setActiveConnectionId,
+    setSessions,
+    setSessionLabel,
+    setSessionLastActiveMap,
+    setMessages,
     setSettingsOpen,
     chatOpen,
     settingsOpen,
@@ -36,12 +42,40 @@ export default function App() {
     if (hasInitializedApp) return;
     hasInitializedApp = true;
     loadConfig()
-      .then((cfg) => {
+      .then(async (cfg) => {
         setConfig(cfg);
         setConnections(cfg.bridges ?? []);
         if (cfg.bridges?.length) {
           setActiveConnectionId(cfg.bridges[0].id);
         }
+
+        // Restore cached sessions from local DB before Bridge connects
+        for (const bridge of cfg.bridges ?? []) {
+          listLocalSessions(bridge.id)
+            .then((data) => {
+              console.log("[sessions] local cache for", bridge.id, ":", data.sessions.length, "sessions, active:", data.activeSessionId, "ids:", data.sessions.map(s => s.id));
+              if (data.sessions.length === 0) return;
+              const ids = data.sessions.map((s) => s.id);
+              setSessions(bridge.id, ids, data.activeSessionId ?? undefined);
+              for (const s of data.sessions) {
+                if (s.name) setSessionLabel(bridge.id, s.id, s.name);
+              }
+              if (data.lastActiveMap && Object.keys(data.lastActiveMap).length > 0) {
+                setSessionLastActiveMap(bridge.id, data.lastActiveMap);
+              }
+              const activeId = data.activeSessionId ?? ids[0];
+              if (activeId) {
+                getHistory(bridge.id, 50, activeId)
+                  .then((msgs) => {
+                    console.log("[sessions] loaded", msgs.length, "history msgs for", bridge.id, activeId);
+                    if (msgs.length > 0) setMessages(bridge.id, activeId, msgs);
+                  })
+                  .catch(console.error);
+              }
+            })
+            .catch((e) => console.error("[sessions] listLocalSessions failed:", e));
+        }
+
         for (const bridge of cfg.bridges ?? []) {
           if (bridge.token?.trim()) {
             connectBridge(bridge.id).catch(console.error);
@@ -52,7 +86,7 @@ export default function App() {
         }
       })
       .catch(console.error);
-  }, [setConfig, setConnections, setActiveConnectionId, setSettingsOpen]);
+  }, [setConfig, setConnections, setActiveConnectionId, setSessions, setSessionLabel, setSessionLastActiveMap, setMessages, setSettingsOpen]);
 
   useEffect(() => {
     let cancelled = false;

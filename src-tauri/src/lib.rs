@@ -1,6 +1,6 @@
 mod bridge;
 mod config;
-mod history;
+pub mod history;
 mod llm;
 mod update;
 
@@ -70,6 +70,14 @@ struct BridgeSessionsData {
     sessions: Vec<BridgeSessionItem>,
     #[serde(rename = "active_session_id")]
     active_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalSessionsData {
+    sessions: Vec<BridgeSessionItem>,
+    active_session_id: Option<String>,
+    last_active_map: HashMap<String, f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,10 +156,94 @@ async fn list_bridge_sessions(
         let err = body.error.unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
         return Err(format!("List sessions failed: {err}"));
     }
-    Ok(body.data.unwrap_or(BridgeSessionsData {
+    let data = body.data.unwrap_or(BridgeSessionsData {
         sessions: vec![],
         active_session_id: None,
-    }))
+    });
+
+    eprintln!(
+        "[sessions] list_bridge_sessions conn={} got {} sessions, active={:?}, ids={:?}",
+        connection_id,
+        data.sessions.len(),
+        data.active_session_id,
+        data.sessions.iter().map(|s| &s.id).collect::<Vec<_>>()
+    );
+
+    // Persist to local DB so sessions survive restarts
+    let pairs: Vec<(String, String)> = data
+        .sessions
+        .iter()
+        .map(|s| (s.id.clone(), s.name.clone()))
+        .collect();
+    match state
+        .history
+        .save_sessions(
+            &connection_id,
+            &pairs,
+            data.active_session_id.as_deref(),
+        )
+        .await
+    {
+        Ok(()) => eprintln!(
+            "[sessions] save_sessions OK conn={} saved {} sessions",
+            connection_id,
+            pairs.len()
+        ),
+        Err(e) => eprintln!(
+            "[sessions] save_sessions FAILED conn={} err={}",
+            connection_id, e
+        ),
+    }
+
+    Ok(data)
+}
+
+#[tauri::command]
+async fn list_local_sessions(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<LocalSessionsData, String> {
+    let rows = state.history.load_sessions(&connection_id).await?;
+    let active = rows.iter().find(|r| r.active).map(|r| r.id.clone());
+    let mut last_active_map = HashMap::new();
+    let sessions: Vec<BridgeSessionItem> = rows
+        .into_iter()
+        .map(|r| {
+            if let Some(ts) = r.last_active_at {
+                last_active_map.insert(r.id.clone(), ts);
+            }
+            BridgeSessionItem {
+                id: r.id,
+                name: r.name,
+                history_count: 0,
+            }
+        })
+        .collect();
+    eprintln!(
+        "[sessions] list_local_sessions conn={} found {} cached sessions, active={:?}, ids={:?}",
+        connection_id,
+        sessions.len(),
+        active,
+        sessions.iter().map(|s| &s.id).collect::<Vec<_>>()
+    );
+    Ok(LocalSessionsData {
+        sessions,
+        active_session_id: active,
+        last_active_map,
+    })
+}
+
+#[tauri::command]
+async fn update_session_label(
+    connection_id: String,
+    session_id: String,
+    label: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state
+        .history
+        .update_session_label(&connection_id, &session_id, &label)
+        .await
 }
 
 #[tauri::command]
@@ -632,6 +724,8 @@ pub fn run() {
             quit_app,
             check_for_updates,
             list_bridge_sessions,
+            list_local_sessions,
+            update_session_label,
             create_bridge_session,
             switch_bridge_session,
             delete_bridge_session,

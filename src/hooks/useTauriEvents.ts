@@ -1,7 +1,8 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { useAppStore } from "@/lib/store";
+import { useAppStore, makeChatKey } from "@/lib/store";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
+import { listBridgeSessions, getHistory } from "@/lib/commands";
 
 function sessionFromReplyCtx(replyCtx?: string): string | null {
   if (!replyCtx) return null;
@@ -19,6 +20,9 @@ export function useTauriEvents() {
     addMessage,
     ensureSession,
     setActiveSessionKey,
+    setSessions,
+    setSessionLabel,
+    setMessages,
     setChatOpen,
     setSettingsOpen,
   } = useAppStore();
@@ -36,6 +40,34 @@ export function useTauriEvents() {
           setPetState(e.payload.connected ? "happy" : "idle");
           if (e.payload.connected) {
             setTimeout(() => setPetState("idle"), 3000);
+            const connId = e.payload.connectionId;
+            console.log("[sessions] bridge-connected, refreshing sessions for", connId);
+            listBridgeSessions(connId)
+              .then((data) => {
+                if (cancelled) return;
+                console.log("[sessions] bridge refresh for", connId, ":", data.sessions.length, "sessions, active:", data.activeSessionId);
+                const ids = data.sessions.map((s) => s.id);
+                setSessions(connId, ids, data.activeSessionId ?? undefined);
+                for (const s of data.sessions) {
+                  if (s.name) setSessionLabel(connId, s.id, s.name);
+                }
+                // Load history for the active session
+                const activeId = data.activeSessionId ?? ids[0];
+                if (activeId) {
+                  const store = useAppStore.getState();
+                  const key = makeChatKey(connId, activeId);
+                  const existing = store.messagesByChat[key];
+                  if (!existing || existing.length === 0) {
+                    getHistory(connId, 50, activeId)
+                      .then((msgs) => {
+                        if (cancelled) return;
+                        if (msgs.length > 0) setMessages(connId, activeId, msgs);
+                      })
+                      .catch(console.error);
+                  }
+                }
+              })
+              .catch(console.error);
           }
         }
       );
@@ -146,5 +178,5 @@ export function useTauriEvents() {
       cancelled = true;
       unlistenFns.forEach((fn) => fn());
     };
-  }, [setConnectionStatus, setPetState, addMessage, ensureSession, setActiveSessionKey, setChatOpen, setSettingsOpen]);
+  }, [setConnectionStatus, setPetState, addMessage, ensureSession, setActiveSessionKey, setSessions, setSessionLabel, setMessages, setChatOpen, setSettingsOpen]);
 }

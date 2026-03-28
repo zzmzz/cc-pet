@@ -79,6 +79,12 @@ export interface BridgeSessionsData {
   activeSessionId?: string;
 }
 
+export interface LocalSessionsData {
+  sessions: BridgeSession[];
+  activeSessionId?: string;
+  lastActiveMap: Record<string, number>;
+}
+
 export type ChatMode = "bridge" | "llm";
 
 export interface LlmMessage {

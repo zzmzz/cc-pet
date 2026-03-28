@@ -17,6 +17,21 @@ pub struct ChatMessage {
     pub timestamp: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSession {
+    pub id: String,
+    pub connection_id: String,
+    pub name: String,
+    pub active: bool,
+    pub last_active_at: Option<f64>,
+}
+
+fn is_generic_name(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    n.is_empty() || n == "default" || n == "新会话" || n == "new session" || n == "new chat"
+}
+
 pub struct ChatHistory {
     conn: Arc<Mutex<Connection>>,
 }
@@ -46,6 +61,23 @@ impl ChatHistory {
                 Connection::open_in_memory().map_err(|e| e.to_string())?
             }
         };
+        init_schema(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    /// Expose the raw connection for diagnostic queries.
+    pub fn raw_conn(&self) -> &Arc<Mutex<Connection>> {
+        &self.conn
+    }
+
+    /// Open a DB at a specific path (for testing / custom locations).
+    pub fn open(path: &std::path::Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let conn = Connection::open(path).map_err(|e| e.to_string())?;
         init_schema(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -148,6 +180,103 @@ impl ChatHistory {
         Ok(msgs)
     }
 
+    /// Replace the cached session list for a connection with fresh data from Bridge.
+    /// Preserves locally-set names (auto-titles) when the Bridge only has a generic name.
+    pub async fn save_sessions(
+        &self,
+        connection_id: &str,
+        sessions: &[(String, String)], // (id, name)
+        active_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+
+        // Read existing names so we can preserve auto-titles
+        let mut existing_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT id, name FROM sessions WHERE connection_id = ?1")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![connection_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(|e| e.to_string())?;
+            for row in rows.flatten() {
+                existing_names.insert(row.0, row.1);
+            }
+        }
+
+        conn.execute(
+            "DELETE FROM sessions WHERE connection_id = ?1",
+            params![connection_id],
+        )
+        .map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("INSERT INTO sessions (id, connection_id, name, active) VALUES (?1, ?2, ?3, ?4)")
+            .map_err(|e| e.to_string())?;
+        for (id, name) in sessions {
+            let is_active = active_session_id.map_or(false, |a| a == id);
+            // Keep the local name if it's a real title and Bridge only has a generic one
+            let final_name = if is_generic_name(name) {
+                existing_names.get(id).filter(|n| !is_generic_name(n)).cloned().unwrap_or_else(|| name.clone())
+            } else {
+                name.clone()
+            };
+            stmt.execute(params![id, connection_id, final_name, is_active])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Update the display name of a single session in the local cache.
+    pub async fn update_session_label(
+        &self,
+        connection_id: &str,
+        session_id: &str,
+        label: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE sessions SET name = ?1 WHERE id = ?2 AND connection_id = ?3",
+            params![label, session_id, connection_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Load cached sessions for a connection from local DB.
+    pub async fn load_sessions(&self, connection_id: &str) -> Result<Vec<LocalSession>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.connection_id, s.name, s.active, m.last_ts \
+                 FROM sessions s \
+                 LEFT JOIN ( \
+                     SELECT session_key, MAX(timestamp) AS last_ts \
+                     FROM messages WHERE connection_id = ?1 \
+                     GROUP BY session_key \
+                 ) m ON m.session_key = s.id \
+                 WHERE s.connection_id = ?1 \
+                 ORDER BY COALESCE(m.last_ts, 0) DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![connection_id], |r| {
+                Ok(LocalSession {
+                    id: r.get(0)?,
+                    connection_id: r.get(1)?,
+                    name: r.get(2)?,
+                    active: r.get(3)?,
+                    last_active_at: r.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>();
+        Ok(rows)
+    }
+
     pub async fn clear(&self, connection_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn.lock().await;
         if let Some(connection_id) = connection_id {
@@ -176,7 +305,14 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
             file_path TEXT,
             timestamp REAL NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_ts ON messages(timestamp DESC);",
+        CREATE INDEX IF NOT EXISTS idx_ts ON messages(timestamp DESC);
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT NOT NULL,
+            connection_id TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (id, connection_id)
+        );",
     )
     .map_err(|e| e.to_string())?;
 
@@ -282,6 +418,138 @@ mod tests {
         h.clear(None).await.unwrap();
         assert_eq!(h.recent("c1", Some("s-default"), 10, None).await.unwrap().len(), 0);
         assert_eq!(h.recent("c2", Some("s-default"), 10, None).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn save_and_load_sessions_round_trip() {
+        let h = ChatHistory::new_in_memory().unwrap();
+        let sessions = vec![
+            ("s1".to_string(), "Chat A".to_string()),
+            ("s2".to_string(), "Chat B".to_string()),
+        ];
+        h.save_sessions("conn1", &sessions, Some("s2")).await.unwrap();
+
+        let loaded = h.load_sessions("conn1").await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, "s1");
+        assert_eq!(loaded[0].name, "Chat A");
+        assert!(!loaded[0].active);
+        assert_eq!(loaded[1].id, "s2");
+        assert_eq!(loaded[1].name, "Chat B");
+        assert!(loaded[1].active);
+    }
+
+    #[tokio::test]
+    async fn save_sessions_replaces_previous_data() {
+        let h = ChatHistory::new_in_memory().unwrap();
+        let v1 = vec![
+            ("old1".to_string(), "Old".to_string()),
+        ];
+        h.save_sessions("conn1", &v1, Some("old1")).await.unwrap();
+
+        let v2 = vec![
+            ("new1".to_string(), "New A".to_string()),
+            ("new2".to_string(), "New B".to_string()),
+        ];
+        h.save_sessions("conn1", &v2, Some("new1")).await.unwrap();
+
+        let loaded = h.load_sessions("conn1").await.unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, "new1");
+        assert_eq!(loaded[1].id, "new2");
+        assert!(loaded.iter().all(|s| s.id != "old1"), "old sessions should be gone");
+    }
+
+    #[tokio::test]
+    async fn sessions_are_isolated_by_connection() {
+        let h = ChatHistory::new_in_memory().unwrap();
+        h.save_sessions("c1", &[("a".into(), "A".into())], None).await.unwrap();
+        h.save_sessions("c2", &[("b".into(), "B".into())], None).await.unwrap();
+
+        let c1 = h.load_sessions("c1").await.unwrap();
+        let c2 = h.load_sessions("c2").await.unwrap();
+        assert_eq!(c1.len(), 1);
+        assert_eq!(c1[0].id, "a");
+        assert_eq!(c2.len(), 1);
+        assert_eq!(c2[0].id, "b");
+    }
+
+    #[tokio::test]
+    async fn load_sessions_returns_empty_for_unknown_connection() {
+        let h = ChatHistory::new_in_memory().unwrap();
+        let loaded = h.load_sessions("nonexistent").await.unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_sessions_with_no_active_marks_all_inactive() {
+        let h = ChatHistory::new_in_memory().unwrap();
+        let sessions = vec![
+            ("s1".to_string(), "A".to_string()),
+            ("s2".to_string(), "B".to_string()),
+        ];
+        h.save_sessions("conn1", &sessions, None).await.unwrap();
+
+        let loaded = h.load_sessions("conn1").await.unwrap();
+        assert!(loaded.iter().all(|s| !s.active));
+    }
+
+    #[tokio::test]
+    async fn save_sessions_does_not_affect_messages() {
+        let h = ChatHistory::new_in_memory().unwrap();
+        h.add(&sample_msg("m1", "conn1", 1.0)).await.unwrap();
+        h.save_sessions("conn1", &[("s1".into(), "X".into())], None).await.unwrap();
+
+        let msgs = h.recent("conn1", Some("s-default"), 10, None).await.unwrap();
+        assert_eq!(msgs.len(), 1, "messages should be untouched by session save");
+    }
+
+    #[tokio::test]
+    async fn update_session_label_persists() {
+        let h = ChatHistory::new_in_memory().unwrap();
+        h.save_sessions("c1", &[("s1".into(), "default".into())], Some("s1"))
+            .await
+            .unwrap();
+
+        h.update_session_label("c1", "s1", "你好世界").await.unwrap();
+
+        let loaded = h.load_sessions("c1").await.unwrap();
+        assert_eq!(loaded[0].name, "你好世界");
+    }
+
+    #[tokio::test]
+    async fn save_sessions_preserves_local_title_over_generic_bridge_name() {
+        let h = ChatHistory::new_in_memory().unwrap();
+        // First save with a generic name
+        h.save_sessions("c1", &[("s1".into(), "default".into())], Some("s1"))
+            .await
+            .unwrap();
+        // User sends a message → auto-title updates the label locally
+        h.update_session_label("c1", "s1", "我的聊天").await.unwrap();
+
+        // Bridge refresh comes in again with generic name "default"
+        h.save_sessions("c1", &[("s1".into(), "default".into())], Some("s1"))
+            .await
+            .unwrap();
+
+        let loaded = h.load_sessions("c1").await.unwrap();
+        assert_eq!(loaded[0].name, "我的聊天", "local title should be preserved");
+    }
+
+    #[tokio::test]
+    async fn save_sessions_uses_bridge_name_when_it_is_meaningful() {
+        let h = ChatHistory::new_in_memory().unwrap();
+        h.save_sessions("c1", &[("s1".into(), "default".into())], None)
+            .await
+            .unwrap();
+
+        // Bridge now returns a real name (e.g. user renamed it on Bridge side)
+        h.save_sessions("c1", &[("s1".into(), "Bridge Title".into())], None)
+            .await
+            .unwrap();
+
+        let loaded = h.load_sessions("c1").await.unwrap();
+        assert_eq!(loaded[0].name, "Bridge Title");
     }
 
     #[test]

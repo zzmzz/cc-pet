@@ -207,25 +207,31 @@ pub fn load_config() -> Result<AppConfig, String> {
     let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
     // Try new format first ([[bridges]] array of tables)
     if let Ok(toml_new) = toml::from_str::<TomlConfigNew>(&text) {
+        let mut needs_save = false;
         let bridges: Vec<BridgeConfig> = toml_new
             .bridges
             .into_iter()
-            .map(|b| BridgeConfig {
-                id: b.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                name: b.name.unwrap_or_else(|| "默认连接".into()),
-                host: b.host.unwrap_or_else(|| "127.0.0.1".into()),
-                port: b.port,
-                token: b.token,
-                platform_name: b.platform_name.unwrap_or_else(|| "desktop-pet".into()),
-                user_id: b.user_id.unwrap_or_else(|| "pet-user".into()),
+            .map(|b| {
+                let has_id = b.id.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                if !has_id { needs_save = true; }
+                BridgeConfig {
+                    id: b.id.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    name: b.name.unwrap_or_else(|| "默认连接".into()),
+                    host: b.host.unwrap_or_else(|| "127.0.0.1".into()),
+                    port: b.port,
+                    token: b.token,
+                    platform_name: b.platform_name.unwrap_or_else(|| "desktop-pet".into()),
+                    user_id: b.user_id.unwrap_or_else(|| "pet-user".into()),
+                }
             })
             .collect();
         let (pet_cfg, llm_cfg) = parse_pet_and_llm(toml_new.pet, toml_new.llm);
-        return Ok(AppConfig {
-            bridges,
-            pet: pet_cfg,
-            llm: llm_cfg,
-        });
+        let cfg = AppConfig { bridges, pet: pet_cfg, llm: llm_cfg };
+        // Persist generated IDs so they remain stable across restarts
+        if needs_save {
+            save_config(&cfg).ok();
+        }
+        return Ok(cfg);
     }
 
     // Fall back to legacy format ([bridge] single table)
@@ -240,11 +246,10 @@ pub fn load_config() -> Result<AppConfig, String> {
         user_id: toml_legacy.bridge.user_id.unwrap_or_else(|| "pet-user".into()),
     };
     let (pet_cfg, llm_cfg) = parse_pet_and_llm(toml_legacy.pet, toml_legacy.llm);
-    Ok(AppConfig {
-        bridges: vec![bridge],
-        pet: pet_cfg,
-        llm: llm_cfg,
-    })
+    let cfg = AppConfig { bridges: vec![bridge], pet: pet_cfg, llm: llm_cfg };
+    // Persist the generated ID so it remains stable across restarts
+    save_config(&cfg).ok();
+    Ok(cfg)
 }
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {

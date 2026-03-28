@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { ChatMessage, PetState, AppConfig, BridgeConfig } from "./types";
 import type { SlashCommand } from "@/components/SlashCommandMenu";
+import { updateSessionLabel } from "./commands";
 
 // ── Utility exports ────────────────────────────────────────────────────────────
 
@@ -42,6 +43,8 @@ interface AppStore {
   setSessionLabel: (connectionId: string, sessionId: string, label: string) => void;
   setActiveSessionKey: (connectionId: string, sessionKey: string) => void;
   ensureSession: (connectionId: string, sessionKey: string) => void;
+  removeSession: (connectionId: string, sessionId: string) => void;
+  setSessionLastActiveMap: (connectionId: string, map: Record<string, number>) => void;
 
   // messages
   messagesByChat: Record<string, ChatMessage[]>;
@@ -146,13 +149,6 @@ export const useAppStore = create<AppStore>((set) => ({
         ...state.activeSessionByConnection,
         [connectionId]: sessionKey,
       },
-      sessionLastActiveByConnection: {
-        ...state.sessionLastActiveByConnection,
-        [connectionId]: {
-          ...(state.sessionLastActiveByConnection[connectionId] ?? {}),
-          [sessionKey]: Date.now(),
-        },
-      },
     })),
 
   ensureSession: (connectionId, sessionKey) =>
@@ -164,6 +160,44 @@ export const useAppStore = create<AppStore>((set) => ({
           ...state.sessionsByConnection,
           [connectionId]: [...existing, sessionKey],
         },
+      };
+    }),
+
+  setSessionLastActiveMap: (connectionId, map) =>
+    set((state) => ({
+      sessionLastActiveByConnection: {
+        ...state.sessionLastActiveByConnection,
+        [connectionId]: {
+          ...(state.sessionLastActiveByConnection[connectionId] ?? {}),
+          ...map,
+        },
+      },
+    })),
+
+  removeSession: (connectionId, sessionId) =>
+    set((state) => {
+      const sessions = (state.sessionsByConnection[connectionId] ?? []).filter(
+        (s) => s !== sessionId,
+      );
+      const chatKey = makeChatKey(connectionId, sessionId);
+      const { [chatKey]: _, ...restMessages } = state.messagesByChat;
+
+      const labels = { ...(state.sessionLabelsByConnection[connectionId] ?? {}) };
+      delete labels[sessionId];
+      const lastActive = { ...(state.sessionLastActiveByConnection[connectionId] ?? {}) };
+      delete lastActive[sessionId];
+
+      const wasActive = state.activeSessionByConnection[connectionId] === sessionId;
+      const newActive = wasActive ? sessions[0] ?? "" : state.activeSessionByConnection[connectionId];
+
+      return {
+        sessionsByConnection: { ...state.sessionsByConnection, [connectionId]: sessions },
+        activeSessionByConnection: newActive
+          ? { ...state.activeSessionByConnection, [connectionId]: newActive }
+          : state.activeSessionByConnection,
+        messagesByChat: restMessages,
+        sessionLabelsByConnection: { ...state.sessionLabelsByConnection, [connectionId]: labels },
+        sessionLastActiveByConnection: { ...state.sessionLastActiveByConnection, [connectionId]: lastActive },
       };
     }),
 
@@ -180,15 +214,17 @@ export const useAppStore = create<AppStore>((set) => ({
       let labelUpdate: Partial<AppStore> = {};
       const existingLabel = state.sessionLabelsByConnection[connectionId]?.[sessionKey];
       if (!existingLabel && msg.role === "user" && msg.contentType === "text") {
+        const title = autoTitle(msg.content);
         labelUpdate = {
           sessionLabelsByConnection: {
             ...state.sessionLabelsByConnection,
             [connectionId]: {
               ...(state.sessionLabelsByConnection[connectionId] ?? {}),
-              [sessionKey]: autoTitle(msg.content),
+              [sessionKey]: title,
             },
           },
         };
+        updateSessionLabel(connectionId, sessionKey, title).catch(console.error);
       }
 
       return {
@@ -235,15 +271,17 @@ export const useAppStore = create<AppStore>((set) => ({
       if (!existingLabel) {
         const firstUserMsg = msgs.find((m) => m.role === "user" && m.contentType === "text");
         if (firstUserMsg) {
+          const title = autoTitle(firstUserMsg.content);
           labelUpdate = {
             sessionLabelsByConnection: {
               ...state.sessionLabelsByConnection,
               [connectionId]: {
                 ...(state.sessionLabelsByConnection[connectionId] ?? {}),
-                [sessionKey]: autoTitle(firstUserMsg.content),
+                [sessionKey]: title,
               },
             },
           };
+          updateSessionLabel(connectionId, sessionKey, title).catch(console.error);
         }
       }
 

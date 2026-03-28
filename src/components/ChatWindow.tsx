@@ -16,7 +16,6 @@ import {
   connectBridge,
   disconnectBridge,
   listBridgeSessions,
-  switchBridgeSession,
   getHistory,
 } from "@/lib/commands";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
@@ -202,15 +201,10 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
 
 export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const {
-    connections,
     activeConnectionId,
-    setActiveConnectionId,
     activeSessionByConnection,
-    sessionsByConnection,
-    sessionLabelsByConnection,
     setSessions,
     setSessionLabel,
-    setActiveSessionKey,
     messagesByChat,
     setMessages,
     chatOpen,
@@ -226,14 +220,6 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const activeSessionKey = activeConnectionId
     ? (activeSessionByConnection[activeConnectionId] ?? null)
     : null;
-
-  const sessions = activeConnectionId
-    ? (sessionsByConnection[activeConnectionId] ?? [])
-    : [];
-
-  const sessionLabels = activeConnectionId
-    ? (sessionLabelsByConnection[activeConnectionId] ?? {})
-    : {};
 
   const messages =
     activeConnectionId && activeSessionKey
@@ -571,11 +557,6 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     setSlashIndex(0);
   }, [slashQuery]);
 
-  const isConnected = activeConnectionId
-    ? (connections[activeConnectionId]?.connected ?? false)
-    : false;
-  const bridgeList = Object.values(connections).map((entry) => entry.config);
-
   return (
     <AnimatePresence>
       {chatOpen && (
@@ -599,14 +580,6 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
             data-tauri-drag-region
           >
             <SessionDropdown />
-            <span
-              className={`ml-1 w-2 h-2 rounded-full flex-shrink-0 ${
-                isConnected ? "bg-green-500" : "bg-red-400"
-              }`}
-            />
-            <span className="ml-1 text-[11px] text-gray-400 flex-shrink-0">
-              {isConnected ? "已连接" : "未连接"}
-            </span>
             <div className="flex-1" data-tauri-drag-region />
             <button
               type="button"
@@ -650,66 +623,6 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               ✕
             </button>
           </div>
-
-          {/* Connection Tabs */}
-          {bridgeList.length > 0 && (
-            <div className="flex items-center gap-1 px-2 py-1.5 border-b border-gray-100 overflow-x-auto shrink-0">
-              {bridgeList.map((bridge) => {
-                const active = activeConnectionId === bridge.id;
-                const online = connections[bridge.id]?.connected ?? false;
-                return (
-                  <button
-                    key={bridge.id}
-                    onClick={() => setActiveConnectionId(bridge.id)}
-                    className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs border transition-colors whitespace-nowrap ${
-                      active
-                        ? "bg-indigo-50 text-indigo-600 border-indigo-200 font-medium"
-                        : "bg-white text-gray-500 border-gray-200 hover:border-gray-300 hover:text-gray-700"
-                    }`}
-                  >
-                    <span
-                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                        online ? "bg-green-500" : "bg-red-400"
-                      }`}
-                    />
-                    {bridge.name}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Session Tabs */}
-          {sessions.length > 1 && (
-            <div className="flex items-center gap-1 px-2 py-1 border-b border-gray-100 overflow-x-auto shrink-0 bg-gray-50/60">
-              {sessions.map((sessionId) => {
-                const label =
-                  sessionLabels[sessionId] ||
-                  sessionId.split(":").pop() ||
-                  sessionId;
-                const isActive = sessionId === activeSessionKey;
-                return (
-                  <button
-                    key={sessionId}
-                    onClick={() => {
-                      if (!activeConnectionId) return;
-                      setActiveSessionKey(activeConnectionId, sessionId);
-                      switchBridgeSession(activeConnectionId, sessionId).catch(
-                        console.error
-                      );
-                    }}
-                    className={`px-2.5 py-0.5 rounded-md text-[11px] border transition-colors whitespace-nowrap ${
-                      isActive
-                        ? "bg-white text-indigo-600 border-indigo-200 font-medium shadow-sm"
-                        : "bg-transparent text-gray-400 border-transparent hover:border-gray-200 hover:text-gray-600"
-                    }`}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
-            </div>
-          )}
 
           {/* Messages */}
           <div className="flex-1 min-h-0 relative flex flex-col">
