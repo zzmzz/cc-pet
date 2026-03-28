@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { ChatMessage, PetState, AppConfig } from "./types";
+import type { SlashCommand } from "@/components/SlashCommandMenu";
 
 interface AppStore {
   // connection
@@ -16,6 +17,10 @@ interface AppStore {
   updateMessage: (id: string, partial: Partial<ChatMessage>) => void;
   clearMessages: () => void;
   setMessages: (msgs: ChatMessage[]) => void;
+
+  // slash commands from agent
+  agentCommands: SlashCommand[];
+  setAgentCommands: (cmds: SlashCommand[]) => void;
 
   // views
   chatOpen: boolean;
@@ -48,6 +53,9 @@ export const useAppStore = create<AppStore>((set) => ({
     })),
   clearMessages: () => set({ messages: [] }),
   setMessages: (msgs) => set({ messages: msgs }),
+
+  agentCommands: [],
+  setAgentCommands: (cmds) => set({ agentCommands: cmds }),
 
   chatOpen: false,
   setChatOpen: (v) => set({ chatOpen: v }),

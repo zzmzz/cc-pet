@@ -8,9 +8,11 @@ import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "@/lib/store";
-import { sendMessage, sendFile, clearHistory, revealFile } from "@/lib/commands";
+import { sendMessage, sendFile, clearHistory, revealFile, connectBridge, disconnectBridge } from "@/lib/commands";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ChatMessage } from "@/lib/types";
+import { SlashCommandMenu, useSlashMenu, getFilteredCommands } from "./SlashCommandMenu";
+import type { SlashCommand } from "./SlashCommandMenu";
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -191,11 +193,15 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     updateMessage,
     clearMessages,
     setPetState,
+    agentCommands,
   } = useAppStore();
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [input, setInput] = useState("");
+  const [slashIndex, setSlashIndex] = useState(0);
   const bridgeStreamBotIdRef = useRef<string | null>(null);
+
+  const { isActive: slashMenuVisible, query: slashQuery } = useSlashMenu(input);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -316,8 +322,86 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     }
   }, [addMessage]);
 
+  const handleSlashSelect = useCallback(
+    async (cmd: SlashCommand) => {
+      setInput("");
+      setSlashIndex(0);
+
+      if (cmd.type === "local") {
+        switch (cmd.command) {
+          case "/clear":
+            clearHistory();
+            clearMessages();
+            break;
+          case "/settings":
+            setSettingsOpen(true);
+            break;
+          case "/connect":
+            connectBridge().catch(console.error);
+            break;
+          case "/disconnect":
+            disconnectBridge().catch(console.error);
+            break;
+        }
+      } else {
+        const userMsg: ChatMessage = {
+          id: `user-${Date.now()}`,
+          role: "user",
+          content: cmd.command,
+          contentType: "text",
+          timestamp: Date.now(),
+        };
+        addMessage(userMsg);
+        setPetState("thinking");
+        try {
+          await sendMessage(cmd.command);
+        } catch (e) {
+          console.error("send failed:", e);
+          setPetState("error");
+          setTimeout(() => setPetState("idle"), 3000);
+        }
+      }
+
+      inputRef.current?.focus();
+    },
+    [addMessage, setPetState, clearMessages, setSettingsOpen]
+  );
+
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (slashMenuVisible) {
+        const filtered = getFilteredCommands(slashQuery, agentCommands);
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setSlashIndex((prev) => (prev + 1) % filtered.length);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setSlashIndex((prev) => (prev - 1 + filtered.length) % filtered.length);
+          return;
+        }
+        if (e.key === "Enter") {
+          e.preventDefault();
+          if (filtered[slashIndex]) {
+            handleSlashSelect(filtered[slashIndex]);
+          }
+          return;
+        }
+        if (e.key === "Tab") {
+          e.preventDefault();
+          if (filtered[slashIndex]) {
+            setInput(filtered[slashIndex].command + " ");
+          }
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setInput("");
+          return;
+        }
+      }
+
       if (e.key === "Enter") {
         if (e.ctrlKey || e.shiftKey || e.metaKey) {
           return;
@@ -329,8 +413,12 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
         setChatOpen(false);
       }
     },
-    [handleSend, setChatOpen]
+    [handleSend, setChatOpen, slashMenuVisible, slashQuery, slashIndex, agentCommands, handleSlashSelect]
   );
+
+  useEffect(() => {
+    setSlashIndex(0);
+  }, [slashQuery]);
 
   const isConnected = connected;
 
@@ -399,7 +487,14 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
           </div>
 
           {/* Input — left padding reserves space for the pet in the corner */}
-          <div className="border-t border-gray-100 p-3 shrink-0" style={{ paddingLeft: petSize + 8 }}>
+          <div className="border-t border-gray-100 p-3 shrink-0 relative" style={{ paddingLeft: petSize + 8 }}>
+            <SlashCommandMenu
+              query={slashQuery}
+              visible={slashMenuVisible}
+              selectedIndex={slashIndex}
+              onSelect={handleSlashSelect}
+              extraCommands={agentCommands}
+            />
             <textarea
               ref={inputRef}
               value={input}
