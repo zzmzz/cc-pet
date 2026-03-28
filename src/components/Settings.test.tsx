@@ -3,7 +3,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Settings } from "./Settings";
 import { useAppStore } from "@/lib/store";
-import type { AppConfig } from "@/lib/types";
+import type { AppConfig, BridgeConfig } from "@/lib/types";
 import * as commands from "@/lib/commands";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -33,13 +33,17 @@ vi.mock("@/lib/commands", () => ({
 }));
 
 const baseConfig: AppConfig = {
-  bridge: {
-    host: "127.0.0.1",
-    port: 9810,
-    token: "token",
-    platformName: "desktop-pet",
-    userId: "pet-user",
-  },
+  bridges: [
+    {
+      id: "conn-1",
+      name: "conn1",
+      host: "127.0.0.1",
+      port: 9810,
+      token: "token",
+      platformName: "desktop-pet",
+      userId: "pet-user",
+    },
+  ],
   pet: {
     size: 120,
     alwaysOnTop: true,
@@ -84,11 +88,35 @@ describe("Settings", () => {
 
     expect(commands.saveConfig).toHaveBeenCalledTimes(1);
     const saved = vi.mocked(commands.saveConfig).mock.calls[0][0] as AppConfig;
-    expect(saved.bridge.token).toBe("new-token");
+    expect(saved.bridges[0].token).toBe("new-token");
     expect(commands.setAlwaysOnTop).toHaveBeenCalledWith(true);
     expect(commands.setWindowOpacity).toHaveBeenCalledWith(0.95);
-    expect(commands.disconnectBridge).toHaveBeenCalled();
     expect(commands.connectBridge).toHaveBeenCalled();
     expect(useAppStore.getState().settingsOpen).toBe(false);
+  });
+
+  it("adds a new bridge even when randomUUID is unavailable", async () => {
+    const user = userEvent.setup();
+    const originalRandomUUID = globalThis.crypto.randomUUID;
+    Object.defineProperty(globalThis.crypto, "randomUUID", {
+      configurable: true,
+      value: undefined,
+    });
+    try {
+      render(<Settings />);
+      await user.click(screen.getAllByRole("button", { name: "+ 添加连接" })[0]);
+      await user.click(screen.getAllByRole("button", { name: "保存" })[0]);
+
+      const saved = vi.mocked(commands.saveConfig).mock.calls[0][0] as AppConfig;
+      expect(saved.bridges).toHaveLength(2);
+      const created = saved.bridges[1] as BridgeConfig;
+      expect(created.id).toMatch(/^bridge-/);
+      expect(created.host).toBe("127.0.0.1");
+    } finally {
+      Object.defineProperty(globalThis.crypto, "randomUUID", {
+        configurable: true,
+        value: originalRandomUUID,
+      });
+    }
   });
 });

@@ -5,6 +5,7 @@ import type {
   LlmMessage,
   UpdateCheckResult,
   ConnectionStatus,
+  BridgeSessionsData,
 } from "./types";
 
 export async function loadConfig(): Promise<AppConfig> {
@@ -27,26 +28,74 @@ export async function getBridgeStatus(): Promise<ConnectionStatus[]> {
   return invoke("get_bridge_status");
 }
 
-export async function sendMessage(
-  connectionId: string,
-  text: string
-): Promise<void> {
-  return invoke("send_message", { connectionId, text });
+export async function listBridgeSessions(connectionId: string): Promise<BridgeSessionsData> {
+  return invoke("list_bridge_sessions", { connectionId });
 }
 
-export async function sendFile(connectionId: string, path: string): Promise<void> {
-  return invoke("send_file", { connectionId, path });
+export async function createBridgeSession(
+  connectionId: string,
+  name?: string,
+): Promise<void> {
+  return invoke("create_bridge_session", { connectionId, name: name ?? null });
+}
+
+export async function switchBridgeSession(
+  connectionId: string,
+  target: string,
+): Promise<void> {
+  return invoke("switch_bridge_session", { connectionId, target });
+}
+
+export async function deleteBridgeSession(
+  connectionId: string,
+  sessionId: string,
+): Promise<void> {
+  return invoke("delete_bridge_session", { connectionId, sessionId });
+}
+
+export async function sendMessage(
+  connectionId: string,
+  text: string,
+  sessionKey?: string,
+  replyCtx?: string,
+): Promise<void> {
+  return invoke("send_message", {
+    connectionId,
+    text,
+    sessionKey: sessionKey ?? null,
+    replyCtx: replyCtx ?? null,
+  });
+}
+
+export async function sendFile(
+  connectionId: string,
+  path: string,
+  sessionKey?: string,
+  replyCtx?: string,
+): Promise<void> {
+  return invoke("send_file", {
+    connectionId,
+    path,
+    sessionKey: sessionKey ?? null,
+    replyCtx: replyCtx ?? null,
+  });
 }
 
 export async function getHistory(
   connectionId: string,
   limit: number,
+  sessionKey?: string,
   beforeId?: string
 ): Promise<ChatMessage[]> {
-  return invoke("get_history", { connectionId, limit, beforeId: beforeId ?? null });
+  return invoke("get_history", {
+    connectionId,
+    sessionKey: sessionKey ?? null,
+    limit,
+    beforeId: beforeId ?? null,
+  });
 }
 
-export async function clearHistory(connectionId?: string): Promise<void> {
+export async function clearHistory(connectionId?: string, _sessionKey?: string): Promise<void> {
   return invoke("clear_history", { connectionId: connectionId ?? null });
 }
 

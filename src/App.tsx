@@ -15,6 +15,8 @@ import {
   setMainWindowSize,
 } from "@/lib/commands";
 
+let hasInitializedApp = false;
+
 export default function App() {
   const {
     config,
@@ -30,8 +32,9 @@ export default function App() {
   const { notice, clearNotice } = useAutoUpdateCheck();
 
   useTauriEvents();
-
   useEffect(() => {
+    if (hasInitializedApp) return;
+    hasInitializedApp = true;
     loadConfig()
       .then((cfg) => {
         setConfig(cfg);

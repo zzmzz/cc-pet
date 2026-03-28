@@ -3,11 +3,22 @@ import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "@/lib/store";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 
+function sessionFromReplyCtx(replyCtx?: string): string | null {
+  if (!replyCtx) return null;
+  if (!replyCtx.startsWith("ccpet:")) return null;
+  const body = replyCtx.slice("ccpet:".length);
+  const idx = body.lastIndexOf(":");
+  if (idx <= 0) return null;
+  return body.slice(0, idx);
+}
+
 export function useTauriEvents() {
   const {
     setConnectionStatus,
     setPetState,
     addMessage,
+    ensureSession,
+    setActiveSessionKey,
     setChatOpen,
     setSettingsOpen,
   } = useAppStore();
@@ -31,14 +42,28 @@ export function useTauriEvents() {
       if (cancelled) { u1(); return; }
       unlistenFns.push(u1);
 
-      const u2 = await listen<{ connectionId: string; content: string }>(
+      const u2 = await listen<{ connectionId: string; sessionKey?: string; replyCtx?: string; content: string }>(
         "bridge-message",
         (e) => {
           if (cancelled) return;
+          const store = useAppStore.getState();
+          const knownSessions = store.sessionsByConnection[e.payload.connectionId] ?? [];
+          const extractedKey = sessionFromReplyCtx(e.payload.replyCtx);
+          const sessionKey =
+            (extractedKey && (knownSessions.length === 0 || knownSessions.includes(extractedKey)) ? extractedKey : null) ||
+            store.activeSessionByConnection[e.payload.connectionId] ||
+            knownSessions[0] ||
+            "default";
+          ensureSession(e.payload.connectionId, sessionKey);
+          if (!store.activeSessionByConnection[e.payload.connectionId]) {
+            setActiveSessionKey(e.payload.connectionId, sessionKey);
+          }
           setPetState("talking");
-          addMessage(e.payload.connectionId, {
+          addMessage(e.payload.connectionId, sessionKey, {
             id: `bot-${Date.now()}`,
             connectionId: e.payload.connectionId,
+            sessionKey,
+            replyCtx: e.payload.replyCtx,
             role: "bot",
             content: e.payload.content,
             contentType: "text",
@@ -50,14 +75,25 @@ export function useTauriEvents() {
       if (cancelled) { u2(); return; }
       unlistenFns.push(u2);
 
-      const u2b = await listen<{ connectionId: string; name: string; path: string }>(
+      const u2b = await listen<{ connectionId: string; sessionKey?: string; replyCtx?: string; name: string; path: string }>(
         "bridge-file-received",
         (e) => {
           if (cancelled) return;
+          const store = useAppStore.getState();
+          const knownSessions = store.sessionsByConnection[e.payload.connectionId] ?? [];
+          const extractedKey = sessionFromReplyCtx(e.payload.replyCtx);
+          const sessionKey =
+            (extractedKey && (knownSessions.length === 0 || knownSessions.includes(extractedKey)) ? extractedKey : null) ||
+            store.activeSessionByConnection[e.payload.connectionId] ||
+            knownSessions[0] ||
+            "default";
+          ensureSession(e.payload.connectionId, sessionKey);
           setPetState("happy");
-          addMessage(e.payload.connectionId, {
+          addMessage(e.payload.connectionId, sessionKey, {
             id: `bot-file-${Date.now()}`,
             connectionId: e.payload.connectionId,
+            sessionKey,
+            replyCtx: e.payload.replyCtx,
             role: "bot",
             content: e.payload.name,
             contentType: "file",
@@ -110,5 +146,5 @@ export function useTauriEvents() {
       cancelled = true;
       unlistenFns.forEach((fn) => fn());
     };
-  }, [setConnectionStatus, setPetState, addMessage, setChatOpen, setSettingsOpen]);
+  }, [setConnectionStatus, setPetState, addMessage, ensureSession, setActiveSessionKey, setChatOpen, setSettingsOpen]);
 }

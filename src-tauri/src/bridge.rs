@@ -7,10 +7,19 @@ use tauri::Emitter;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::config::BridgeConfig;
+use crate::history::{ChatHistory, ChatMessage};
 
 pub enum BridgeCommand {
-    SendText(String),
-    SendFile(String),
+    SendText {
+        text: String,
+        session_key: Option<String>,
+        reply_ctx: Option<String>,
+    },
+    SendFile {
+        path: String,
+        session_key: Option<String>,
+        reply_ctx: Option<String>,
+    },
     Stop,
 }
 
@@ -27,7 +36,7 @@ enum SendLoopExit {
 }
 
 impl BridgeClient {
-    pub fn start(connection_id: String, cfg: BridgeConfig, app: tauri::AppHandle) -> Self {
+    pub fn start(connection_id: String, cfg: BridgeConfig, app: tauri::AppHandle, history: ChatHistory) -> Self {
         let (tx, rx) = mpsc::channel::<BridgeCommand>(64);
         let rx = Arc::new(Mutex::new(rx));
         let client_id = CLIENT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -35,22 +44,40 @@ impl BridgeClient {
         let connected_for_loop = connected.clone();
 
         tokio::spawn(async move {
-            bridge_loop(connection_id, cfg, app, rx, client_id, connected_for_loop).await;
+            bridge_loop(connection_id, cfg, app, rx, client_id, connected_for_loop, history).await;
         });
 
         Self { tx, connected }
     }
 
-    pub async fn send_text(&self, text: String) -> Result<(), String> {
+    pub async fn send_text(
+        &self,
+        text: String,
+        session_key: Option<String>,
+        reply_ctx: Option<String>,
+    ) -> Result<(), String> {
         self.tx
-            .send(BridgeCommand::SendText(text))
+            .send(BridgeCommand::SendText {
+                text,
+                session_key,
+                reply_ctx,
+            })
             .await
             .map_err(|e| e.to_string())
     }
 
-    pub async fn send_file(&self, path: String) -> Result<(), String> {
+    pub async fn send_file(
+        &self,
+        path: String,
+        session_key: Option<String>,
+        reply_ctx: Option<String>,
+    ) -> Result<(), String> {
         self.tx
-            .send(BridgeCommand::SendFile(path))
+            .send(BridgeCommand::SendFile {
+                path,
+                session_key,
+                reply_ctx,
+            })
             .await
             .map_err(|e| e.to_string())
     }
@@ -183,7 +210,14 @@ fn save_attachment(attachment: &Value) -> Option<(String, String)> {
     Some((safe_name, path.to_string_lossy().to_string()))
 }
 
-fn handle_attachments(connection_id: &str, val: &Value, app: &tauri::AppHandle) {
+async fn handle_attachments(
+    connection_id: &str,
+    session_key: &str,
+    reply_ctx: &str,
+    val: &Value,
+    app: &tauri::AppHandle,
+    history: &ChatHistory,
+) {
     let attachments = val
         .get("attachments")
         .or_else(|| val.get("data").and_then(|d| d.get("attachments")))
@@ -192,17 +226,57 @@ fn handle_attachments(connection_id: &str, val: &Value, app: &tauri::AppHandle) 
     if let Some(atts) = attachments {
         for att in atts {
             if let Some((name, path)) = save_attachment(att) {
+                // Save file message to history
+                let msg = ChatMessage {
+                    id: format!("bot-file-{}", chrono::Utc::now().timestamp_millis()),
+                    connection_id: connection_id.to_string(),
+                    session_key: session_key.to_string(),
+                    role: "bot".to_string(),
+                    content: name.clone(),
+                    content_type: "file".to_string(),
+                    file_path: Some(path.clone()),
+                    timestamp: chrono::Utc::now().timestamp_millis() as f64,
+                };
+                if let Err(e) = history.add(&msg).await {
+                    eprintln!("[bridge] failed to save file to history: {e}");
+                }
                 let _ = app.emit(
                     "bridge-file-received",
-                    json!({ "connectionId": connection_id, "name": name, "path": path }),
+                    json!({
+                        "connectionId": connection_id,
+                        "sessionKey": session_key,
+                        "replyCtx": reply_ctx,
+                        "name": name,
+                        "path": path
+                    }),
                 );
             }
         }
     }
 }
 
-fn make_message(text: &str, cfg: &BridgeConfig) -> String {
-    let session_key = format!("{}:{}:{}", cfg.platform_name, cfg.user_id, cfg.user_id);
+fn default_session_key(cfg: &BridgeConfig) -> String {
+    format!("{}:{}:{}", cfg.platform_name, cfg.user_id, cfg.user_id)
+}
+
+fn default_reply_ctx(cfg: &BridgeConfig) -> String {
+    format!("ctx-{}", cfg.user_id)
+}
+
+fn make_message(
+    text: &str,
+    cfg: &BridgeConfig,
+    session_key: Option<&str>,
+    reply_ctx: Option<&str>,
+) -> String {
+    let session_key = session_key
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| default_session_key(cfg));
+    let reply_ctx = reply_ctx
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| default_reply_ctx(cfg));
     json!({
         "type": "message",
         "msg_id": format!("pet-{}", uuid::Uuid::new_v4().to_string()[..8].to_string()),
@@ -210,12 +284,17 @@ fn make_message(text: &str, cfg: &BridgeConfig) -> String {
         "user_id": cfg.user_id,
         "user_name": "Desktop Pet",
         "content": text,
-        "reply_ctx": format!("ctx-{}", cfg.user_id),
+        "reply_ctx": reply_ctx,
     })
     .to_string()
 }
 
-fn make_file_message(path: &str, cfg: &BridgeConfig) -> Result<String, String> {
+fn make_file_message(
+    path: &str,
+    cfg: &BridgeConfig,
+    session_key: Option<&str>,
+    reply_ctx: Option<&str>,
+) -> Result<String, String> {
     let file_path = std::path::Path::new(path);
     let data = std::fs::read(file_path).map_err(|e| e.to_string())?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
@@ -223,7 +302,14 @@ fn make_file_message(path: &str, cfg: &BridgeConfig) -> Result<String, String> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
-    let session_key = format!("{}:{}:{}", cfg.platform_name, cfg.user_id, cfg.user_id);
+    let session_key = session_key
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| default_session_key(cfg));
+    let reply_ctx = reply_ctx
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| default_reply_ctx(cfg));
     Ok(json!({
         "type": "message",
         "msg_id": format!("pet-file-{}", uuid::Uuid::new_v4().to_string()[..8].to_string()),
@@ -231,7 +317,7 @@ fn make_file_message(path: &str, cfg: &BridgeConfig) -> Result<String, String> {
         "user_id": cfg.user_id,
         "user_name": "Desktop Pet",
         "content": format!("[文件: {}]", name),
-        "reply_ctx": format!("ctx-{}", cfg.user_id),
+        "reply_ctx": reply_ctx,
         "attachments": [{"type": "file", "name": name, "data": b64}],
     })
     .to_string())
@@ -288,6 +374,7 @@ async fn bridge_loop(
     rx: Arc<Mutex<mpsc::Receiver<BridgeCommand>>>,
     client_id: u64,
     connected: Arc<AtomicBool>,
+    history: ChatHistory,
 ) {
     let mut backoff = 1u64;
 
@@ -325,8 +412,13 @@ async fn bridge_loop(
                         tokio::select! {
                             cmd = rx.recv() => {
                                 match cmd {
-                                    Some(BridgeCommand::SendText(text)) => {
-                                        let msg = make_message(&text, &cfg2);
+                                    Some(BridgeCommand::SendText { text, session_key, reply_ctx }) => {
+                                        let msg = make_message(
+                                            &text,
+                                            &cfg2,
+                                            session_key.as_deref(),
+                                            reply_ctx.as_deref(),
+                                        );
                                         eprintln!("[bridge:{client_id}] sending text frame, bytes={}", msg.len());
                                         if write.send(Message::Text(msg.into())).await.is_err() {
                                             eprintln!("[bridge:{client_id}] send text failed; disconnected");
@@ -334,8 +426,13 @@ async fn bridge_loop(
                                         }
                                         eprintln!("[bridge:{client_id}] text frame sent");
                                     }
-                                    Some(BridgeCommand::SendFile(path)) => {
-                                        match make_file_message(&path, &cfg2) {
+                                    Some(BridgeCommand::SendFile { path, session_key, reply_ctx }) => {
+                                        match make_file_message(
+                                            &path,
+                                            &cfg2,
+                                            session_key.as_deref(),
+                                            reply_ctx.as_deref(),
+                                        ) {
                                             Ok(msg) => {
                                                 if write.send(Message::Text(msg.into())).await.is_err() {
                                                     eprintln!("[bridge:{client_id}] send file failed; disconnected");
@@ -370,6 +467,7 @@ async fn bridge_loop(
                 let app3 = app.clone();
                 let connected_for_recv = connected.clone();
                 let connection_id3 = connection_id.clone();
+                let history3 = history.clone();
                 let recv_handle = tokio::spawn(async move {
                     while let Some(Ok(msg)) = read.next().await {
                         if let Message::Text(text) = msg {
@@ -381,7 +479,7 @@ async fn bridge_loop(
                                 {
                                     connected_for_recv.store(true, Ordering::Relaxed);
                                 }
-                                handle_message(&connection_id3, &val, &app3);
+                                handle_message(&connection_id3, &val, &app3, &history3).await;
                             }
                         }
                     }
@@ -430,7 +528,19 @@ async fn bridge_loop(
     }
 }
 
-fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle) {
+async fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle, history: &ChatHistory) {
+    let session_key = val
+        .get("session_key")
+        .and_then(|v| v.as_str())
+        .or_else(|| val.get("data").and_then(|d| d.get("session_key")).and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let reply_ctx = val
+        .get("reply_ctx")
+        .and_then(|v| v.as_str())
+        .or_else(|| val.get("data").and_then(|d| d.get("reply_ctx")).and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
     let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match msg_type {
         "register_ack" => {
@@ -460,13 +570,32 @@ fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle) {
                 .or_else(|| val.get("message").and_then(|v| v.as_str()))
             {
                 if !content.is_empty() {
+                    // Save to history
+                    let msg = ChatMessage {
+                        id: format!("bot-{}", chrono::Utc::now().timestamp_millis()),
+                        connection_id: connection_id.to_string(),
+                        session_key: session_key.clone(),
+                        role: "bot".to_string(),
+                        content: content.to_string(),
+                        content_type: "text".to_string(),
+                        file_path: None,
+                        timestamp: chrono::Utc::now().timestamp_millis() as f64,
+                    };
+                    if let Err(e) = history.add(&msg).await {
+                        eprintln!("[bridge] failed to save reply to history: {e}");
+                    }
                     let _ = app.emit(
                         "bridge-message",
-                        json!({ "connectionId": connection_id, "content": content }),
+                        json!({
+                            "connectionId": connection_id,
+                            "sessionKey": session_key,
+                            "replyCtx": reply_ctx,
+                            "content": content
+                        }),
                     );
                 }
             }
-            handle_attachments(connection_id, val, app);
+            handle_attachments(connection_id, &session_key, &reply_ctx, val, app, history).await;
         }
         "reply_stream" => {
             let done = val.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -484,24 +613,53 @@ fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle) {
                     });
                 if let Some(text) = full.filter(|s| !s.is_empty()) {
                     eprintln!("[bridge] emit bridge-stream-done len={}", text.len());
+                    // Save to history
+                    let msg = ChatMessage {
+                        id: format!("bot-{}", chrono::Utc::now().timestamp_millis()),
+                        connection_id: connection_id.to_string(),
+                        session_key: session_key.clone(),
+                        role: "bot".to_string(),
+                        content: text.clone(),
+                        content_type: "text".to_string(),
+                        file_path: None,
+                        timestamp: chrono::Utc::now().timestamp_millis() as f64,
+                    };
+                    if let Err(e) = history.add(&msg).await {
+                        eprintln!("[bridge] failed to save stream-done to history: {e}");
+                    }
                     let _ = app.emit(
                         "bridge-stream-done",
-                        json!({ "connectionId": connection_id, "fullText": text }),
+                        json!({
+                            "connectionId": connection_id,
+                            "sessionKey": session_key,
+                            "replyCtx": reply_ctx,
+                            "fullText": text
+                        }),
                     );
                 } else {
                     eprintln!("[bridge] emit bridge-stream-done empty");
                     let _ = app.emit(
                         "bridge-stream-done",
-                        json!({ "connectionId": connection_id, "fullText": String::new() }),
+                        json!({
+                            "connectionId": connection_id,
+                            "sessionKey": session_key,
+                            "replyCtx": reply_ctx,
+                            "fullText": String::new()
+                        }),
                     );
                 }
-                handle_attachments(connection_id, val, app);
+                handle_attachments(connection_id, &session_key, &reply_ctx, val, app, history).await;
             } else if let Some(chunk) = reply_stream_chunk(val) {
                 if !chunk.is_empty() {
                     eprintln!("[bridge] emit bridge-stream-delta len={}", chunk.len());
                     let _ = app.emit(
                         "bridge-stream-delta",
-                        json!({ "connectionId": connection_id, "delta": chunk }),
+                        json!({
+                            "connectionId": connection_id,
+                            "sessionKey": session_key,
+                            "replyCtx": reply_ctx,
+                            "delta": chunk
+                        }),
                     );
                 }
             }
@@ -510,9 +668,28 @@ fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle) {
             if let Some(content) = val.get("content").and_then(|v| v.as_str()) {
                 if !content.is_empty() {
                     eprintln!("[bridge] emit bridge-message(buttons) len={}", content.len());
+                    // Save to history
+                    let msg = ChatMessage {
+                        id: format!("bot-{}", chrono::Utc::now().timestamp_millis()),
+                        connection_id: connection_id.to_string(),
+                        session_key: session_key.clone(),
+                        role: "bot".to_string(),
+                        content: content.to_string(),
+                        content_type: "text".to_string(),
+                        file_path: None,
+                        timestamp: chrono::Utc::now().timestamp_millis() as f64,
+                    };
+                    if let Err(e) = history.add(&msg).await {
+                        eprintln!("[bridge] failed to save buttons to history: {e}");
+                    }
                     let _ = app.emit(
                         "bridge-message",
-                        json!({ "connectionId": connection_id, "content": content }),
+                        json!({
+                            "connectionId": connection_id,
+                            "sessionKey": session_key,
+                            "replyCtx": reply_ctx,
+                            "content": content
+                        }),
                     );
                 }
             }
@@ -526,6 +703,43 @@ fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle) {
                 "bridge-error",
                 json!({ "connectionId": connection_id, "error": msg }),
             );
+        }
+        "" => {
+            // No explicit type field - treat as a plain message if content is present
+            if let Some(content) = val
+                .get("content")
+                .and_then(|v| v.as_str())
+                .or_else(|| val.get("text").and_then(|v| v.as_str()))
+            {
+                if !content.is_empty() {
+                    eprintln!("[bridge] emit bridge-message (no type) len={}", content.len());
+                    // Save to history
+                    let msg = ChatMessage {
+                        id: format!("bot-{}", chrono::Utc::now().timestamp_millis()),
+                        connection_id: connection_id.to_string(),
+                        session_key: session_key.clone(),
+                        role: "bot".to_string(),
+                        content: content.to_string(),
+                        content_type: "text".to_string(),
+                        file_path: None,
+                        timestamp: chrono::Utc::now().timestamp_millis() as f64,
+                    };
+                    if let Err(e) = history.add(&msg).await {
+                        eprintln!("[bridge] failed to save no-type message to history: {e}");
+                    }
+                    let _ = app.emit(
+                        "bridge-message",
+                        json!({
+                            "connectionId": connection_id,
+                            "sessionKey": session_key,
+                            "replyCtx": reply_ctx,
+                            "content": content
+                        }),
+                    );
+                }
+            } else {
+                eprintln!("[bridge] ignored message with no type and no content");
+            }
         }
         other => {
             eprintln!("[bridge] ignored message type={}", other);
@@ -625,7 +839,7 @@ mod tests {
 
     #[test]
     fn message_payload_has_session_key() {
-        let v: Value = serde_json::from_str(&make_message("hello", &test_cfg())).unwrap();
+        let v: Value = serde_json::from_str(&make_message("hello", &test_cfg(), None, None)).unwrap();
         assert_eq!(v["type"], "message");
         assert_eq!(v["content"], "hello");
         assert_eq!(v["session_key"], "desktop-pet:pet-user:pet-user");
@@ -634,7 +848,7 @@ mod tests {
     #[test]
     fn make_message_json_includes_type_content_and_session_key() {
         let cfg = test_cfg();
-        let raw = make_message("ping 测试", &cfg);
+        let raw = make_message("ping 测试", &cfg, None, None);
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("message"));
         assert_eq!(v.get("content").and_then(|x| x.as_str()), Some("ping 测试"));
@@ -688,5 +902,22 @@ mod tests {
         let empty: Value = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(reply_stream_chunk(&done), None);
         assert_eq!(reply_stream_chunk(&empty), None);
+    }
+
+    #[test]
+    fn make_message_uses_custom_session_fields_when_provided() {
+        let cfg = test_cfg();
+        let raw = make_message(
+            "hello",
+            &cfg,
+            Some("desktop-pet:user-a:room-42"),
+            Some("ctx-room-42"),
+        );
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v.get("session_key").and_then(|x| x.as_str()),
+            Some("desktop-pet:user-a:room-42")
+        );
+        assert_eq!(v.get("reply_ctx").and_then(|x| x.as_str()), Some("ctx-room-42"));
     }
 }

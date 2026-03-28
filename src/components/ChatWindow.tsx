@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useCallback, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,7 +7,7 @@ import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useAppStore } from "@/lib/store";
+import { useAppStore, makeChatKey } from "@/lib/store";
 import {
   sendMessage,
   sendFile,
@@ -15,12 +15,22 @@ import {
   revealFile,
   connectBridge,
   disconnectBridge,
+  listBridgeSessions,
+  switchBridgeSession,
+  getHistory,
 } from "@/lib/commands";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ChatMessage } from "@/lib/types";
 import { SlashCommandMenu, useSlashMenu, getFilteredCommands } from "./SlashCommandMenu";
 import type { SlashCommand } from "./SlashCommandMenu";
+import { SessionDropdown } from "./SessionDropdown";
+
+const NEAR_BOTTOM_PX = 72;
+
+function isNearBottom(el: HTMLDivElement, threshold = NEAR_BOTTOM_PX) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+}
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -192,104 +202,212 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
 
 export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const {
-    messagesByConnection,
-    chatOpen,
-    setChatOpen,
-    setSettingsOpen,
     connections,
     activeConnectionId,
     setActiveConnectionId,
+    activeSessionByConnection,
+    sessionsByConnection,
+    sessionLabelsByConnection,
+    setSessions,
+    setSessionLabel,
+    setActiveSessionKey,
+    messagesByChat,
+    setMessages,
+    chatOpen,
+    setChatOpen,
+    setSettingsOpen,
     addMessage,
     updateMessage,
     clearMessages,
     setPetState,
     agentCommands,
   } = useAppStore();
+
+  const activeSessionKey = activeConnectionId
+    ? (activeSessionByConnection[activeConnectionId] ?? null)
+    : null;
+
+  const sessions = activeConnectionId
+    ? (sessionsByConnection[activeConnectionId] ?? [])
+    : [];
+
+  const sessionLabels = activeConnectionId
+    ? (sessionLabelsByConnection[activeConnectionId] ?? {})
+    : {};
+
+  const messages =
+    activeConnectionId && activeSessionKey
+      ? (messagesByChat[makeChatKey(activeConnectionId, activeSessionKey)] ?? [])
+      : [];
   const scrollRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [input, setInput] = useState("");
   const [slashIndex, setSlashIndex] = useState(0);
   const [updateChecking, setUpdateChecking] = useState(false);
-  const bridgeStreamBotIdRef = useRef<Record<string, string | null>>({});
-  const messages = activeConnectionId
-    ? messagesByConnection[activeConnectionId] ?? []
-    : [];
+  const [showJumpLatest, setShowJumpLatest] = useState(false);
+  const bridgeStreamBotIdRef = useRef<string | null>(null);
 
   const { isActive: slashMenuVisible, query: slashQuery } = useSlashMenu(input);
 
+  const scrollMessagesToBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, []);
+
+  const syncScrollFlags = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const near = isNearBottom(el);
+    stickToBottomRef.current = near;
+    setShowJumpLatest(!near);
+  }, []);
+
+  const jumpToLatest = useCallback(() => {
+    stickToBottomRef.current = true;
+    scrollMessagesToBottom();
+    setShowJumpLatest(false);
+  }, [scrollMessagesToBottom]);
+
+  useLayoutEffect(() => {
+    if (!chatOpen) return;
+    stickToBottomRef.current = true;
+    scrollMessagesToBottom();
+    let raf1 = 0;
+    let raf2 = 0;
+    raf1 = requestAnimationFrame(() => {
+      scrollMessagesToBottom();
+      raf2 = requestAnimationFrame(() => {
+        scrollMessagesToBottom();
+        syncScrollFlags();
+      });
+    });
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+    };
+  }, [chatOpen, scrollMessagesToBottom, syncScrollFlags]);
+
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    if (!chatOpen) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    if (stickToBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, chatOpen]);
+
+  const onMessagesScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const near = isNearBottom(el);
+    stickToBottomRef.current = near;
+    setShowJumpLatest(!near);
+  }, []);
 
   useEffect(() => {
     if (chatOpen) inputRef.current?.focus();
   }, [chatOpen]);
+
+  // 当激活连接变化时，从后端拉取会话列表
+  useEffect(() => {
+    if (!activeConnectionId) return;
+    listBridgeSessions(activeConnectionId)
+      .then((data) => {
+        setSessions(
+          activeConnectionId,
+          data.sessions.map((s) => s.id),
+          data.activeSessionId ?? undefined
+        );
+        for (const s of data.sessions) {
+          if (s.name) setSessionLabel(activeConnectionId, s.id, s.name);
+        }
+      })
+      .catch(() => undefined);
+  }, [activeConnectionId, setSessions, setSessionLabel]);
+
+  // 当激活会话变化且消息为空时，加载历史记录
+  useEffect(() => {
+    if (!activeConnectionId || !activeSessionKey) return;
+    const key = makeChatKey(activeConnectionId, activeSessionKey);
+    const current = messagesByChat[key];
+    if (current && current.length > 0) return;
+    getHistory(activeConnectionId, 50, activeSessionKey)
+      .then((msgs) => {
+        if (msgs.length > 0) setMessages(activeConnectionId, activeSessionKey, msgs);
+      })
+      .catch(() => undefined);
+  }, [activeConnectionId, activeSessionKey, setMessages, messagesByChat]);
 
   useEffect(() => {
     let cancelled = false;
     const unlistenFns: Array<() => void> = [];
 
     async function setup() {
-      const u3 = await listen<{ connectionId: string; delta: string }>(
-        "bridge-stream-delta",
-        (e) => {
-          if (cancelled) return;
-          const store = useAppStore.getState();
-          const { connectionId, delta } = e.payload;
-          let id = bridgeStreamBotIdRef.current[connectionId];
-          if (!id) {
-            id = `bot-bridge-${Date.now()}`;
-            bridgeStreamBotIdRef.current[connectionId] = id;
-            store.addMessage(connectionId, {
-              id,
-              connectionId,
-              role: "bot",
-              content: delta,
-              contentType: "text",
-              timestamp: Date.now(),
-            });
-            store.setPetState("talking");
-          } else {
-            const prev =
-              (store.messagesByConnection[connectionId] ?? []).find(
-                (m) => m.id === id
-              )?.content || "";
-            store.updateMessage(connectionId, id, { content: prev + delta });
-          }
+      const u3 = await listen<{
+        connectionId: string;
+        sessionKey: string;
+        replyCtx?: string;
+        delta: string;
+      }>("bridge-stream-delta", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const { connectionId, sessionKey, delta } = e.payload;
+        let id = bridgeStreamBotIdRef.current;
+        if (!id) {
+          id = `bot-bridge-${Date.now()}`;
+          bridgeStreamBotIdRef.current = id;
+          store.addMessage(connectionId, sessionKey, {
+            id,
+            connectionId,
+            sessionKey,
+            role: "bot",
+            content: delta,
+            contentType: "text",
+            timestamp: Date.now(),
+          });
+          store.setPetState("talking");
+        } else {
+          const chatKey = makeChatKey(connectionId, sessionKey);
+          const prev =
+            (store.messagesByChat[chatKey] ?? []).find((m) => m.id === id)?.content || "";
+          store.updateMessage(connectionId, sessionKey, id, { content: prev + delta });
         }
-      );
+      });
       if (cancelled) { u3(); return; }
       unlistenFns.push(u3);
 
-      const u4 = await listen<{ connectionId: string; fullText: string }>(
-        "bridge-stream-done",
-        (e) => {
-          if (cancelled) return;
-          const store = useAppStore.getState();
-          const { connectionId, fullText } = e.payload;
-          const id = bridgeStreamBotIdRef.current[connectionId];
-          if (id) {
-            if (fullText.length > 0) {
-              store.updateMessage(connectionId, id, { content: fullText });
-            }
-            bridgeStreamBotIdRef.current[connectionId] = null;
-          } else if (fullText.length > 0) {
-            store.addMessage(connectionId, {
-              id: `bot-${Date.now()}`,
-              connectionId,
-              role: "bot",
-              content: fullText,
-              contentType: "text",
-              timestamp: Date.now(),
-            });
-          } else {
-            bridgeStreamBotIdRef.current[connectionId] = null;
+      const u4 = await listen<{
+        connectionId: string;
+        sessionKey: string;
+        replyCtx?: string;
+        fullText: string;
+      }>("bridge-stream-done", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const { connectionId, sessionKey, fullText } = e.payload;
+        const id = bridgeStreamBotIdRef.current;
+        if (id) {
+          if (fullText.length > 0) {
+            store.updateMessage(connectionId, sessionKey, id, { content: fullText });
           }
-          store.setPetState("idle");
+          bridgeStreamBotIdRef.current = null;
+        } else if (fullText.length > 0) {
+          store.addMessage(connectionId, sessionKey, {
+            id: `bot-${Date.now()}`,
+            connectionId,
+            sessionKey,
+            role: "bot",
+            content: fullText,
+            contentType: "text",
+            timestamp: Date.now(),
+          });
+        } else {
+          bridgeStreamBotIdRef.current = null;
         }
-      );
+        store.setPetState("idle");
+      });
       if (cancelled) { u4(); return; }
       unlistenFns.push(u4);
     }
@@ -303,52 +421,53 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   }, []);
 
   const handleSend = useCallback(async () => {
-    if (!activeConnectionId) return;
     const text = input.trim();
-    if (!text) return;
+    if (!text || !activeConnectionId || !activeSessionKey) return;
     setInput("");
 
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
       connectionId: activeConnectionId,
+      sessionKey: activeSessionKey,
       role: "user",
       content: text,
       contentType: "text",
       timestamp: Date.now(),
     };
-    addMessage(activeConnectionId, userMsg);
+    addMessage(activeConnectionId, activeSessionKey, userMsg);
 
     setPetState("thinking");
     try {
-      await sendMessage(activeConnectionId, text);
+      await sendMessage(activeConnectionId, text, activeSessionKey);
     } catch (e) {
       console.error("send failed:", e);
       setPetState("error");
       setTimeout(() => setPetState("idle"), 3000);
     }
-  }, [activeConnectionId, input, addMessage, setPetState]);
+  }, [input, activeConnectionId, activeSessionKey, addMessage, setPetState]);
 
   const handleAttach = useCallback(async () => {
-    if (!activeConnectionId) return;
+    if (!activeConnectionId || !activeSessionKey) return;
     const selected = await open({ multiple: false });
     if (selected) {
-      const path = typeof selected === "string" ? selected : selected;
-      addMessage(activeConnectionId, {
+      const path = String(selected);
+      addMessage(activeConnectionId, activeSessionKey, {
         id: `file-${Date.now()}`,
         connectionId: activeConnectionId,
+        sessionKey: activeSessionKey,
         role: "user",
-        content: String(path).split("/").pop() || "file",
+        content: path.split(/[/\\]/).pop() || "file",
         contentType: "file",
-        filePath: String(path),
+        filePath: path,
         timestamp: Date.now(),
       });
       try {
-        await sendFile(activeConnectionId, String(path));
+        await sendFile(activeConnectionId, path, activeSessionKey);
       } catch (e) {
         console.error("send file failed:", e);
       }
     }
-  }, [activeConnectionId, addMessage]);
+  }, [activeConnectionId, activeSessionKey, addMessage]);
 
   const handleSlashSelect = useCallback(
     async (cmd: SlashCommand) => {
@@ -358,39 +477,35 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
       if (cmd.type === "local") {
         switch (cmd.command) {
           case "/clear":
-            if (activeConnectionId) {
-              clearHistory(activeConnectionId);
-              clearMessages(activeConnectionId);
+            if (activeConnectionId && activeSessionKey) {
+              clearHistory(activeConnectionId).catch(console.error);
+              clearMessages(activeConnectionId, activeSessionKey);
             }
             break;
           case "/settings":
             setSettingsOpen(true);
             break;
           case "/connect":
-            if (activeConnectionId) {
-              connectBridge(activeConnectionId).catch(console.error);
-            }
+            if (activeConnectionId) connectBridge(activeConnectionId).catch(console.error);
             break;
           case "/disconnect":
-            if (activeConnectionId) {
-              disconnectBridge(activeConnectionId).catch(console.error);
-            }
+            if (activeConnectionId) disconnectBridge(activeConnectionId).catch(console.error);
             break;
         }
-      } else {
-        if (!activeConnectionId) return;
+      } else if (activeConnectionId && activeSessionKey) {
         const userMsg: ChatMessage = {
           id: `user-${Date.now()}`,
           connectionId: activeConnectionId,
+          sessionKey: activeSessionKey,
           role: "user",
           content: cmd.command,
           contentType: "text",
           timestamp: Date.now(),
         };
-        addMessage(activeConnectionId, userMsg);
+        addMessage(activeConnectionId, activeSessionKey, userMsg);
         setPetState("thinking");
         try {
-          await sendMessage(activeConnectionId, cmd.command);
+          await sendMessage(activeConnectionId, cmd.command, activeSessionKey);
         } catch (e) {
           console.error("send failed:", e);
           setPetState("error");
@@ -400,7 +515,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
 
       inputRef.current?.focus();
     },
-    [activeConnectionId, addMessage, setPetState, clearMessages, setSettingsOpen]
+    [activeConnectionId, activeSessionKey, addMessage, setPetState, clearMessages, setSettingsOpen]
   );
 
   const handleKeyDown = useCallback(
@@ -457,7 +572,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   }, [slashQuery]);
 
   const isConnected = activeConnectionId
-    ? connections[activeConnectionId]?.connected ?? false
+    ? (connections[activeConnectionId]?.connected ?? false)
     : false;
   const bridgeList = Object.values(connections).map((entry) => entry.config);
 
@@ -483,13 +598,13 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
             }}
             data-tauri-drag-region
           >
-            <span className="font-bold text-gray-800 text-sm">CC Pet</span>
+            <SessionDropdown />
             <span
-              className={`ml-2 w-2 h-2 rounded-full ${
+              className={`ml-1 w-2 h-2 rounded-full flex-shrink-0 ${
                 isConnected ? "bg-green-500" : "bg-red-400"
               }`}
             />
-            <span className="ml-1.5 text-[11px] text-gray-400">
+            <span className="ml-1 text-[11px] text-gray-400 flex-shrink-0">
               {isConnected ? "已连接" : "未连接"}
             </span>
             <div className="flex-1" data-tauri-drag-region />
@@ -519,9 +634,9 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
             </button>
             <button
               onClick={() => {
-                if (activeConnectionId) {
-                  clearHistory(activeConnectionId);
-                  clearMessages(activeConnectionId);
+                if (activeConnectionId && activeSessionKey) {
+                  clearHistory(activeConnectionId).catch(console.error);
+                  clearMessages(activeConnectionId, activeSessionKey);
                 }
               }}
               className="text-[11px] text-gray-400 hover:text-red-500 transition-colors mr-2"
@@ -535,48 +650,92 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               ✕
             </button>
           </div>
+
           {/* Connection Tabs */}
-          <div className="flex items-center gap-1 px-2 py-1 border-b border-gray-100 overflow-x-auto">
-            {bridgeList.map((bridge) => {
-              const active = activeConnectionId === bridge.id;
-              const online = connections[bridge.id]?.connected ?? false;
-              return (
-                <button
-                  key={bridge.id}
-                  onClick={() => setActiveConnectionId(bridge.id)}
-                  className={`px-2.5 py-1 rounded-lg text-xs border transition-colors whitespace-nowrap ${
-                    active
-                      ? "bg-indigo-50 text-indigo-600 border-indigo-200"
-                      : "bg-white text-gray-500 border-gray-200 hover:border-gray-300"
-                  }`}
-                >
-                  <span
-                    className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${
-                      online ? "bg-green-500" : "bg-red-400"
+          {bridgeList.length > 0 && (
+            <div className="flex items-center gap-1 px-2 py-1.5 border-b border-gray-100 overflow-x-auto shrink-0">
+              {bridgeList.map((bridge) => {
+                const active = activeConnectionId === bridge.id;
+                const online = connections[bridge.id]?.connected ?? false;
+                return (
+                  <button
+                    key={bridge.id}
+                    onClick={() => setActiveConnectionId(bridge.id)}
+                    className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs border transition-colors whitespace-nowrap ${
+                      active
+                        ? "bg-indigo-50 text-indigo-600 border-indigo-200 font-medium"
+                        : "bg-white text-gray-500 border-gray-200 hover:border-gray-300 hover:text-gray-700"
                     }`}
-                  />
-                  {bridge.name}
-                </button>
-              );
-            })}
-            <button
-              onClick={() => setSettingsOpen(true)}
-              className="px-2 py-1 rounded-lg text-xs text-gray-500 border border-gray-200 hover:bg-gray-50"
-            >
-              + 添加
-            </button>
-          </div>
+                  >
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                        online ? "bg-green-500" : "bg-red-400"
+                      }`}
+                    />
+                    {bridge.name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Session Tabs */}
+          {sessions.length > 1 && (
+            <div className="flex items-center gap-1 px-2 py-1 border-b border-gray-100 overflow-x-auto shrink-0 bg-gray-50/60">
+              {sessions.map((sessionId) => {
+                const label =
+                  sessionLabels[sessionId] ||
+                  sessionId.split(":").pop() ||
+                  sessionId;
+                const isActive = sessionId === activeSessionKey;
+                return (
+                  <button
+                    key={sessionId}
+                    onClick={() => {
+                      if (!activeConnectionId) return;
+                      setActiveSessionKey(activeConnectionId, sessionId);
+                      switchBridgeSession(activeConnectionId, sessionId).catch(
+                        console.error
+                      );
+                    }}
+                    className={`px-2.5 py-0.5 rounded-md text-[11px] border transition-colors whitespace-nowrap ${
+                      isActive
+                        ? "bg-white text-indigo-600 border-indigo-200 font-medium shadow-sm"
+                        : "bg-transparent text-gray-400 border-transparent hover:border-gray-200 hover:text-gray-600"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
           {/* Messages */}
-          <div ref={scrollRef} className="flex-1 overflow-y-auto py-3 space-y-1">
-            {messages.length === 0 && (
-              <div className="flex items-center justify-center h-full text-gray-300 text-sm">
-                双击宠物开始聊天
-              </div>
+          <div className="flex-1 min-h-0 relative flex flex-col">
+            <div
+              ref={scrollRef}
+              onScroll={onMessagesScroll}
+              className="flex-1 min-h-0 overflow-y-auto py-3 space-y-1"
+            >
+              {messages.length === 0 && (
+                <div className="flex items-center justify-center h-full text-gray-300 text-sm">
+                  双击宠物开始聊天
+                </div>
+              )}
+              {messages.map((msg) => (
+                <MessageBubble key={msg.id} msg={msg} />
+              ))}
+            </div>
+            {showJumpLatest && (
+              <button
+                type="button"
+                onClick={jumpToLatest}
+                className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 rounded-full bg-indigo-500 text-white text-xs font-semibold px-4 py-2 shadow-lg shadow-indigo-500/25 hover:bg-indigo-600 transition-colors"
+              >
+                查看最新
+              </button>
             )}
-            {messages.map((msg) => (
-              <MessageBubble key={msg.id} msg={msg} />
-            ))}
           </div>
 
           {/* Input — left padding reserves space for the pet in the corner */}
@@ -607,7 +766,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               <div className="flex-1" />
               <button
                 onClick={handleSend}
-                disabled={!input.trim() || !activeConnectionId}
+                disabled={!input.trim() || !activeConnectionId || !activeSessionKey}
                 className="bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg px-5 py-1.5 transition-colors"
               >
                 发送

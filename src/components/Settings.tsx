@@ -14,9 +14,21 @@ import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 
+function makeId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `bridge-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function normalizeBridges(config: AppConfig): AppConfig {
+  const bridges = Array.isArray(config.bridges) ? config.bridges : [];
+  return { ...config, bridges };
+}
+
 function createBridge(): BridgeConfig {
   return {
-    id: crypto.randomUUID(),
+    id: makeId(),
     name: "新连接",
     host: "127.0.0.1",
     port: 9810,
@@ -43,7 +55,8 @@ export function Settings() {
 
   useEffect(() => {
     if (config && settingsOpen) {
-      setForm(JSON.parse(JSON.stringify(config)));
+      const safe = normalizeBridges(config);
+      setForm(JSON.parse(JSON.stringify(safe)));
     }
   }, [config, settingsOpen]);
 
@@ -113,7 +126,9 @@ export function Settings() {
     setForm((prev) => {
       if (!prev) return prev;
       const next = JSON.parse(JSON.stringify(prev)) as AppConfig;
-      next.bridges[index][field] = value as never;
+      const bridges = Array.isArray(next.bridges) ? next.bridges : [];
+      if (!bridges[index]) return next;
+      bridges[index][field] = value as never;
       return next;
     });
   };
@@ -121,9 +136,10 @@ export function Settings() {
   const addBridge = () => {
     setForm((prev) => {
       if (!prev) return prev;
+      const bridges = Array.isArray(prev.bridges) ? prev.bridges : [];
       return {
         ...prev,
-        bridges: [...prev.bridges, createBridge()],
+        bridges: [...bridges, createBridge()],
       };
     });
   };
@@ -131,9 +147,10 @@ export function Settings() {
   const removeBridge = (id: string) => {
     setForm((prev) => {
       if (!prev) return prev;
+      const bridges = Array.isArray(prev.bridges) ? prev.bridges : [];
       return {
         ...prev,
-        bridges: prev.bridges.filter((b) => b.id !== id),
+        bridges: bridges.filter((b) => b.id !== id),
       };
     });
   };
@@ -144,7 +161,8 @@ export function Settings() {
     try {
       await saveConfig(form);
       setConfig(form);
-      setConnections(form.bridges);
+      const bridges = Array.isArray(form.bridges) ? form.bridges : [];
+      setConnections(bridges);
       await setAlwaysOnTop(form.pet.alwaysOnTop);
       await setWindowOpacity(form.pet.chatWindowOpacity);
 
@@ -152,7 +170,7 @@ export function Settings() {
       for (const id of oldIds) {
         await disconnectBridge(id).catch(() => undefined);
       }
-      for (const bridge of form.bridges) {
+      for (const bridge of bridges) {
         if (bridge.token.trim()) {
           await connectBridge(bridge.id).catch(console.error);
         }
@@ -234,7 +252,7 @@ export function Settings() {
                   cc-connect Bridge
                 </h3>
                 <div className="space-y-4">
-                  {form.bridges.map((bridge, index) => (
+                  {(Array.isArray(form.bridges) ? form.bridges : []).map((bridge, index) => (
                     <div
                       key={bridge.id}
                       className="rounded-xl border border-gray-200 p-3 space-y-3"

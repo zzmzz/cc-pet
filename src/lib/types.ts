@@ -3,11 +3,21 @@ export type PetState = "idle" | "thinking" | "talking" | "happy" | "error";
 export interface ChatMessage {
   id: string;
   connectionId: string;
+  sessionKey: string;
+  replyCtx?: string;
   role: "user" | "bot";
   content: string;
   contentType: "text" | "file" | "image";
   filePath?: string;
   timestamp: number;
+}
+
+export interface Session {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: number;
+  lastActiveAt: number;
 }
 
 export interface BridgeConfig {
@@ -56,6 +66,17 @@ export interface ConnectionStatus {
   id: string;
   name: string;
   connected: boolean;
+}
+
+export interface BridgeSession {
+  id: string;
+  name: string;
+  historyCount: number;
+}
+
+export interface BridgeSessionsData {
+  sessions: BridgeSession[];
+  activeSessionId?: string;
 }
 
 export type ChatMode = "bridge" | "llm";

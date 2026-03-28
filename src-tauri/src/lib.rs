@@ -6,7 +6,7 @@ mod update;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager, Size};
 use tokio::sync::Mutex;
 
@@ -23,12 +23,216 @@ struct AppState {
     tray: StdMutex<Option<tauri::tray::TrayIcon>>,
 }
 
+fn default_session_key(bridge: &config::BridgeConfig) -> String {
+    format!(
+        "{}:{}:{}",
+        bridge.platform_name, bridge.user_id, bridge.user_id
+    )
+}
+
+async fn resolve_session_key(
+    state: &tauri::State<'_, Arc<AppState>>,
+    connection_id: &str,
+    requested: Option<String>,
+) -> Option<String> {
+    if let Some(s) = requested {
+        if !s.trim().is_empty() {
+            return Some(s);
+        }
+    }
+    let cfg = state.config.lock().await.clone();
+    cfg.bridges
+        .iter()
+        .find(|b| b.id == connection_id)
+        .map(default_session_key)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BridgeStatus {
     id: String,
     name: String,
     connected: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeSessionItem {
+    id: String,
+    name: String,
+    #[serde(rename = "history_count")]
+    history_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeSessionsData {
+    sessions: Vec<BridgeSessionItem>,
+    #[serde(rename = "active_session_id")]
+    active_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BridgeEnvelope<T> {
+    ok: bool,
+    data: Option<T>,
+    error: Option<String>,
+}
+
+async fn switch_remote_session_if_needed(
+    state: &tauri::State<'_, Arc<AppState>>,
+    connection_id: &str,
+    target: &str,
+) -> Result<(), String> {
+    if target.trim().is_empty() || target.contains(':') {
+        return Ok(());
+    }
+    let cfg = state.config.lock().await.clone();
+    let bridge_cfg = cfg
+        .bridges
+        .iter()
+        .find(|b| b.id == connection_id)
+        .cloned()
+        .ok_or_else(|| format!("Bridge not found: {connection_id}"))?;
+    let session_key = default_session_key(&bridge_cfg);
+    let url = format!("http://{}:{}/bridge/sessions/switch", bridge_cfg.host, bridge_cfg.port);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .bearer_auth(bridge_cfg.token)
+        .json(&serde_json::json!({
+            "session_key": session_key,
+            "target": target,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body: BridgeEnvelope<serde_json::Value> = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() || !body.ok {
+        let err = body.error.unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+        return Err(format!("Switch session failed: {err}"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_bridge_sessions(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<BridgeSessionsData, String> {
+    let cfg = state.config.lock().await.clone();
+    let bridge_cfg = cfg
+        .bridges
+        .iter()
+        .find(|b| b.id == connection_id)
+        .cloned()
+        .ok_or_else(|| format!("Bridge not found: {connection_id}"))?;
+    let session_key = default_session_key(&bridge_cfg);
+    let url = format!(
+        "http://{}:{}/bridge/sessions?session_key={}",
+        bridge_cfg.host,
+        bridge_cfg.port,
+        urlencoding::encode(&session_key)
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(url)
+        .bearer_auth(bridge_cfg.token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body: BridgeEnvelope<BridgeSessionsData> = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() || !body.ok {
+        let err = body.error.unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+        return Err(format!("List sessions failed: {err}"));
+    }
+    Ok(body.data.unwrap_or(BridgeSessionsData {
+        sessions: vec![],
+        active_session_id: None,
+    }))
+}
+
+#[tauri::command]
+async fn create_bridge_session(
+    connection_id: String,
+    name: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let cfg = state.config.lock().await.clone();
+    let bridge_cfg = cfg
+        .bridges
+        .iter()
+        .find(|b| b.id == connection_id)
+        .cloned()
+        .ok_or_else(|| format!("Bridge not found: {connection_id}"))?;
+    let session_key = default_session_key(&bridge_cfg);
+    let url = format!("http://{}:{}/bridge/sessions", bridge_cfg.host, bridge_cfg.port);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(url)
+        .bearer_auth(bridge_cfg.token)
+        .json(&serde_json::json!({
+            "session_key": session_key,
+            "name": name.unwrap_or_else(|| "default".to_string()),
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body: BridgeEnvelope<serde_json::Value> = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() || !body.ok {
+        let err = body.error.unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+        return Err(format!("Create session failed: {err}"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn switch_bridge_session(
+    connection_id: String,
+    target: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    switch_remote_session_if_needed(&state, &connection_id, &target).await
+}
+
+#[tauri::command]
+async fn delete_bridge_session(
+    connection_id: String,
+    session_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let cfg = state.config.lock().await.clone();
+    let bridge_cfg = cfg
+        .bridges
+        .iter()
+        .find(|b| b.id == connection_id)
+        .cloned()
+        .ok_or_else(|| format!("Bridge not found: {connection_id}"))?;
+    let session_key = default_session_key(&bridge_cfg);
+    let url = format!(
+        "http://{}:{}/bridge/sessions/{}?session_key={}",
+        bridge_cfg.host,
+        bridge_cfg.port,
+        urlencoding::encode(&session_id),
+        urlencoding::encode(&session_key)
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(url)
+        .bearer_auth(bridge_cfg.token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body: BridgeEnvelope<serde_json::Value> = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() || !body.ok {
+        let err = body.error.unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+        return Err(format!("Delete session failed: {err}"));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -74,7 +278,8 @@ async fn connect_bridge(
         "[bridge] starting client id={} host={} port={} platform={}",
         connection_id, bridge_cfg.host, bridge_cfg.port, bridge_cfg.platform_name
     );
-    let client = BridgeClient::start(connection_id.clone(), bridge_cfg, app);
+    let history = state.history.clone();
+    let client = BridgeClient::start(connection_id.clone(), bridge_cfg, app, history);
     state.bridges.lock().await.insert(connection_id, client);
     Ok(())
 }
@@ -113,6 +318,8 @@ async fn get_bridge_status(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec
 async fn send_message(
     connection_id: String,
     text: String,
+    session_key: Option<String>,
+    reply_ctx: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     eprintln!("[bridge] send_message called, len={}", text.len());
@@ -125,19 +332,28 @@ async fn send_message(
         }
     };
     // save to history
+    if let Some(target) = session_key.as_deref() {
+        switch_remote_session_if_needed(&state, &connection_id, target).await?;
+    }
     let msg = ChatMessage {
         id: format!("user-{}", chrono::Utc::now().timestamp_millis()),
         connection_id: connection_id.clone(),
+        session_key: resolve_session_key(&state, &connection_id, session_key.clone())
+            .await
+            .unwrap_or_default(),
         role: "user".into(),
         content: text.clone(),
         content_type: "text".into(),
         file_path: None,
         timestamp: chrono::Utc::now().timestamp_millis() as f64,
     };
-    if let Err(e) = state.history.add(&msg) {
+    if let Err(e) = state.history.add(&msg).await {
         eprintln!("[bridge] history add failed, continue sending: {e}");
     }
-    let result = client.send_text(text).await;
+    let ws_session_key = resolve_session_key(&state, &connection_id, session_key).await;
+    let result = client
+        .send_text(text, ws_session_key, reply_ctx)
+        .await;
     if let Err(ref e) = result {
         eprintln!("[bridge] send_message enqueue failed: {e}");
     } else {
@@ -150,8 +366,13 @@ async fn send_message(
 async fn send_file(
     connection_id: String,
     path: String,
+    session_key: Option<String>,
+    reply_ctx: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    if let Some(target) = session_key.as_deref() {
+        switch_remote_session_if_needed(&state, &connection_id, target).await?;
+    }
     let guard = state.bridges.lock().await;
     let client = match guard.get(&connection_id) {
         Some(c) => c,
@@ -166,27 +387,34 @@ async fn send_file(
         .unwrap_or_else(|| "file".into());
     let msg = ChatMessage {
         id: format!("file-{}", chrono::Utc::now().timestamp_millis()),
-        connection_id,
+        connection_id: connection_id.clone(),
+        session_key: resolve_session_key(&state, &connection_id, session_key.clone())
+            .await
+            .unwrap_or_default(),
         role: "user".into(),
         content: name,
         content_type: "file".into(),
         file_path: Some(path.clone()),
         timestamp: chrono::Utc::now().timestamp_millis() as f64,
     };
-    if let Err(e) = state.history.add(&msg) {
+    if let Err(e) = state.history.add(&msg).await {
         eprintln!("[bridge] history add failed for file, continue sending: {e}");
     }
-    client.send_file(path).await
+    let ws_session_key = resolve_session_key(&state, &connection_id, session_key).await;
+    client.send_file(path, ws_session_key, reply_ctx).await
 }
 
 #[tauri::command]
 async fn get_history(
     connection_id: String,
+    session_key: Option<String>,
     limit: u32,
     before_id: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<ChatMessage>, String> {
-    state.history.recent(&connection_id, limit, before_id.as_deref())
+    state
+        .history
+        .recent(&connection_id, session_key.as_deref(), limit, before_id.as_deref()).await
 }
 
 #[tauri::command]
@@ -194,7 +422,7 @@ async fn clear_history(
     connection_id: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    state.history.clear(connection_id.as_deref())
+    state.history.clear(connection_id.as_deref()).await
 }
 
 #[tauri::command]
@@ -298,7 +526,6 @@ async fn set_main_window_size(width: f64, height: f64, app: tauri::AppHandle) ->
         let old_size = win.outer_size().map_err(|e| e.to_string())?;
         let old_pos = win.outer_position().map_err(|e| e.to_string())?;
 
-        let old_w = old_size.width as f64 / scale;
         let old_h = old_size.height as f64 / scale;
 
         let dy = height - old_h;
@@ -404,6 +631,10 @@ pub fn run() {
             reveal_file,
             quit_app,
             check_for_updates,
+            list_bridge_sessions,
+            create_bridge_session,
+            switch_bridge_session,
+            delete_bridge_session,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| {
