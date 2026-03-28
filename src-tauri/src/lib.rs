@@ -195,6 +195,19 @@ async fn list_bridge_sessions(
         ),
     }
 
+    // Return locally-preserved names instead of raw Bridge names
+    let mut data = data;
+    if let Ok(saved) = state.history.load_sessions(&connection_id).await {
+        let name_map: HashMap<String, String> = saved.into_iter().map(|s| (s.id, s.name)).collect();
+        for s in &mut data.sessions {
+            if let Some(n) = name_map.get(&s.id) {
+                if !n.is_empty() {
+                    s.name = n.clone();
+                }
+            }
+        }
+    }
+
     Ok(data)
 }
 
