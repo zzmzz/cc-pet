@@ -27,7 +27,7 @@ enum SendLoopExit {
 }
 
 impl BridgeClient {
-    pub fn start(cfg: BridgeConfig, app: tauri::AppHandle) -> Self {
+    pub fn start(connection_id: String, cfg: BridgeConfig, app: tauri::AppHandle) -> Self {
         let (tx, rx) = mpsc::channel::<BridgeCommand>(64);
         let rx = Arc::new(Mutex::new(rx));
         let client_id = CLIENT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -35,7 +35,7 @@ impl BridgeClient {
         let connected_for_loop = connected.clone();
 
         tokio::spawn(async move {
-            bridge_loop(cfg, app, rx, client_id, connected_for_loop).await;
+            bridge_loop(connection_id, cfg, app, rx, client_id, connected_for_loop).await;
         });
 
         Self { tx, connected }
@@ -183,7 +183,7 @@ fn save_attachment(attachment: &Value) -> Option<(String, String)> {
     Some((safe_name, path.to_string_lossy().to_string()))
 }
 
-fn handle_attachments(val: &Value, app: &tauri::AppHandle) {
+fn handle_attachments(connection_id: &str, val: &Value, app: &tauri::AppHandle) {
     let attachments = val
         .get("attachments")
         .or_else(|| val.get("data").and_then(|d| d.get("attachments")))
@@ -194,7 +194,7 @@ fn handle_attachments(val: &Value, app: &tauri::AppHandle) {
             if let Some((name, path)) = save_attachment(att) {
                 let _ = app.emit(
                     "bridge-file-received",
-                    json!({ "name": name, "path": path }),
+                    json!({ "connectionId": connection_id, "name": name, "path": path }),
                 );
             }
         }
@@ -282,6 +282,7 @@ fn reply_stream_chunk(val: &Value) -> Option<String> {
 }
 
 async fn bridge_loop(
+    connection_id: String,
     cfg: BridgeConfig,
     app: tauri::AppHandle,
     rx: Arc<Mutex<mpsc::Receiver<BridgeCommand>>>,
@@ -304,7 +305,10 @@ async fn bridge_loop(
                 // register
                 if let Err(e) = write.send(Message::Text(make_register(&cfg.platform_name).into())).await {
                     eprintln!("[bridge:{client_id}] register send failed: {e}");
-                    let _ = app.emit("bridge-error", format!("Register failed: {e}"));
+                    let _ = app.emit(
+                        "bridge-error",
+                        json!({ "connectionId": connection_id, "error": format!("Register failed: {e}") }),
+                    );
                     continue;
                 }
                 eprintln!("[bridge:{client_id}] register sent");
@@ -312,6 +316,7 @@ async fn bridge_loop(
                 let app2 = app.clone();
                 let cfg2 = cfg.clone();
                 let rx2 = rx.clone();
+                let connection_id2 = connection_id.clone();
 
                 // send loop
                 let send_handle = tokio::spawn(async move {
@@ -338,7 +343,10 @@ async fn bridge_loop(
                                                 }
                                             }
                                             Err(e) => {
-                                                let _ = app2.emit("bridge-error", format!("File send failed: {e}"));
+                                                let _ = app2.emit(
+                                                    "bridge-error",
+                                                    json!({ "connectionId": connection_id2, "error": format!("File send failed: {e}") }),
+                                                );
                                             }
                                         }
                                     }
@@ -361,6 +369,7 @@ async fn bridge_loop(
                 // recv loop
                 let app3 = app.clone();
                 let connected_for_recv = connected.clone();
+                let connection_id3 = connection_id.clone();
                 let recv_handle = tokio::spawn(async move {
                     while let Some(Ok(msg)) = read.next().await {
                         if let Message::Text(text) = msg {
@@ -372,7 +381,7 @@ async fn bridge_loop(
                                 {
                                     connected_for_recv.store(true, Ordering::Relaxed);
                                 }
-                                handle_message(&val, &app3);
+                                handle_message(&connection_id3, &val, &app3);
                             }
                         }
                     }
@@ -392,7 +401,10 @@ async fn bridge_loop(
                 };
 
                 connected.store(false, Ordering::Relaxed);
-                let _ = app.emit("bridge-connected", false);
+                let _ = app.emit(
+                    "bridge-connected",
+                    json!({ "connectionId": connection_id, "connected": false }),
+                );
                 if !should_reconnect {
                     eprintln!("[bridge:{client_id}] stopped by request; exiting loop");
                     return;
@@ -401,8 +413,14 @@ async fn bridge_loop(
             Err(e) => {
                 eprintln!("[bridge:{client_id}] connect failed: {e}");
                 connected.store(false, Ordering::Relaxed);
-                let _ = app.emit("bridge-error", format!("Connection failed: {e}"));
-                let _ = app.emit("bridge-connected", false);
+                let _ = app.emit(
+                    "bridge-error",
+                    json!({ "connectionId": connection_id, "error": format!("Connection failed: {e}") }),
+                );
+                let _ = app.emit(
+                    "bridge-connected",
+                    json!({ "connectionId": connection_id, "connected": false }),
+                );
             }
         }
 
@@ -412,20 +430,26 @@ async fn bridge_loop(
     }
 }
 
-fn handle_message(val: &Value, app: &tauri::AppHandle) {
+fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle) {
     let msg_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match msg_type {
         "register_ack" => {
             if val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 eprintln!("[bridge] register_ack ok");
-                let _ = app.emit("bridge-connected", true);
+                let _ = app.emit(
+                    "bridge-connected",
+                    json!({ "connectionId": connection_id, "connected": true }),
+                );
             } else {
                 let err = val
                     .get("error")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 eprintln!("[bridge] register_ack rejected: {err}");
-                let _ = app.emit("bridge-error", format!("Registration rejected: {err}"));
+                let _ = app.emit(
+                    "bridge-error",
+                    json!({ "connectionId": connection_id, "error": format!("Registration rejected: {err}") }),
+                );
             }
         }
         "reply" => {
@@ -436,10 +460,13 @@ fn handle_message(val: &Value, app: &tauri::AppHandle) {
                 .or_else(|| val.get("message").and_then(|v| v.as_str()))
             {
                 if !content.is_empty() {
-                    let _ = app.emit("bridge-message", content.to_string());
+                    let _ = app.emit(
+                        "bridge-message",
+                        json!({ "connectionId": connection_id, "content": content }),
+                    );
                 }
             }
-            handle_attachments(val, app);
+            handle_attachments(connection_id, val, app);
         }
         "reply_stream" => {
             let done = val.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -457,16 +484,25 @@ fn handle_message(val: &Value, app: &tauri::AppHandle) {
                     });
                 if let Some(text) = full.filter(|s| !s.is_empty()) {
                     eprintln!("[bridge] emit bridge-stream-done len={}", text.len());
-                    let _ = app.emit("bridge-stream-done", text);
+                    let _ = app.emit(
+                        "bridge-stream-done",
+                        json!({ "connectionId": connection_id, "fullText": text }),
+                    );
                 } else {
                     eprintln!("[bridge] emit bridge-stream-done empty");
-                    let _ = app.emit("bridge-stream-done", String::new());
+                    let _ = app.emit(
+                        "bridge-stream-done",
+                        json!({ "connectionId": connection_id, "fullText": String::new() }),
+                    );
                 }
-                handle_attachments(val, app);
+                handle_attachments(connection_id, val, app);
             } else if let Some(chunk) = reply_stream_chunk(val) {
                 if !chunk.is_empty() {
                     eprintln!("[bridge] emit bridge-stream-delta len={}", chunk.len());
-                    let _ = app.emit("bridge-stream-delta", chunk);
+                    let _ = app.emit(
+                        "bridge-stream-delta",
+                        json!({ "connectionId": connection_id, "delta": chunk }),
+                    );
                 }
             }
         }
@@ -474,7 +510,10 @@ fn handle_message(val: &Value, app: &tauri::AppHandle) {
             if let Some(content) = val.get("content").and_then(|v| v.as_str()) {
                 if !content.is_empty() {
                     eprintln!("[bridge] emit bridge-message(buttons) len={}", content.len());
-                    let _ = app.emit("bridge-message", content.to_string());
+                    let _ = app.emit(
+                        "bridge-message",
+                        json!({ "connectionId": connection_id, "content": content }),
+                    );
                 }
             }
         }
@@ -483,7 +522,10 @@ fn handle_message(val: &Value, app: &tauri::AppHandle) {
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Bridge error");
-            let _ = app.emit("bridge-error", msg.to_string());
+            let _ = app.emit(
+                "bridge-error",
+                json!({ "connectionId": connection_id, "error": msg }),
+            );
         }
         other => {
             eprintln!("[bridge] ignored message type={}", other);
@@ -498,6 +540,8 @@ mod tests {
 
     fn test_cfg() -> BridgeConfig {
         BridgeConfig {
+            id: "test-bridge".to_string(),
+            name: "Test".to_string(),
             host: "127.0.0.1".to_string(),
             port: 9810,
             token: "test-token:&$".to_string(),
@@ -553,20 +597,30 @@ mod tests {
     #[test]
     fn register_payload_has_capabilities_and_metadata() {
         let v: Value = serde_json::from_str(&make_register("my-platform")).unwrap();
-        let caps = v["capabilities"].as_array().expect("capabilities array");
-        let cap_set: HashSet<_> = caps.iter().filter_map(|x| x.as_str()).collect();
-        assert!(cap_set.contains("text"));
-        assert!(cap_set.contains("buttons"));
-        assert!(cap_set.contains("file"));
+        let caps: HashSet<&str> = v["capabilities"]
+            .as_array()
+            .expect("capabilities array")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        for need in ["text", "buttons", "file"] {
+            assert!(caps.contains(need), "missing capability {need:?}");
+        }
         let meta = v["metadata"].as_object().expect("metadata object");
         assert_eq!(meta.get("protocol_version").and_then(|x| x.as_u64()), Some(1));
-        assert!(meta.get("version").and_then(|x| x.as_str()).unwrap_or("").len() > 0);
-        assert!(meta
+        let version = meta
+            .get("version")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        assert!(!version.is_empty(), "metadata.version should be non-empty");
+        let description = meta
             .get("description")
             .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .len()
-            > 0);
+            .unwrap_or("");
+        assert!(
+            !description.is_empty(),
+            "metadata.description should be non-empty"
+        );
     }
 
     #[test]

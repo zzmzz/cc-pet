@@ -394,11 +394,23 @@ export function Pet({ size = 120 }: { size?: number }) {
         x: [0, -4, 4, -4, 4, 0],
         transition: { duration: 0.4 },
       });
+    } else {
+      controls.start({ x: 0, y: 0, transition: { duration: 0.15 } });
     }
   }, [petState, controls]);
 
   const lastMouseDownRef = useRef<number>(0);
+  const dragPointerCleanupRef = useRef<(() => void) | null>(null);
   const DOUBLE_CLICK_THRESHOLD = 400;
+  /** 超过此位移再 startDragging，避免双击时第一次按下已进入拖动并与 resize 竞态导致 WebView 花屏/黑条 */
+  const DRAG_MOVE_THRESHOLD_PX = 5;
+
+  const clearDragPointerListeners = useCallback(() => {
+    dragPointerCleanupRef.current?.();
+    dragPointerCleanupRef.current = null;
+  }, []);
+
+  useEffect(() => () => clearDragPointerListeners(), [clearDragPointerListeners]);
 
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
@@ -410,14 +422,47 @@ export function Pet({ size = 120 }: { size?: number }) {
 
       if (elapsed < DOUBLE_CLICK_THRESHOLD) {
         lastMouseDownRef.current = 0;
+        clearDragPointerListeners();
         setChatOpen(!chatOpen);
         return;
       }
 
       e.preventDefault();
-      getCurrentWindow().startDragging().catch(console.error);
+      clearDragPointerListeners();
+
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const thresholdSq = DRAG_MOVE_THRESHOLD_PX * DRAG_MOVE_THRESHOLD_PX;
+      let dragStarted = false;
+
+      const cleanup = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        if (dragPointerCleanupRef.current === cleanup) {
+          dragPointerCleanupRef.current = null;
+        }
+      };
+
+      const onMove = (ev: MouseEvent) => {
+        if (dragStarted) return;
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+        if (dx * dx + dy * dy >= thresholdSq) {
+          dragStarted = true;
+          getCurrentWindow().startDragging().catch(console.error);
+          cleanup();
+        }
+      };
+
+      const onUp = () => {
+        cleanup();
+      };
+
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+      dragPointerCleanupRef.current = cleanup;
     },
-    [setChatOpen, chatOpen]
+    [setChatOpen, chatOpen, clearDragPointerListeners]
   );
 
   const handleContextMenu = useCallback(

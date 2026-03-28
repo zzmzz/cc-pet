@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppConfig, ChatMessage, LlmMessage, UpdateCheckResult } from "./types";
+import type {
+  AppConfig,
+  ChatMessage,
+  LlmMessage,
+  UpdateCheckResult,
+  ConnectionStatus,
+} from "./types";
 
 export async function loadConfig(): Promise<AppConfig> {
   return invoke("load_config");
@@ -9,35 +15,39 @@ export async function saveConfig(config: AppConfig): Promise<void> {
   return invoke("save_config", { config });
 }
 
-export async function connectBridge(): Promise<void> {
-  return invoke("connect_bridge");
+export async function connectBridge(connectionId: string): Promise<void> {
+  return invoke("connect_bridge", { connectionId });
 }
 
-export async function disconnectBridge(): Promise<void> {
-  return invoke("disconnect_bridge");
+export async function disconnectBridge(connectionId: string): Promise<void> {
+  return invoke("disconnect_bridge", { connectionId });
 }
 
-export async function getBridgeConnected(): Promise<boolean> {
-  return invoke("get_bridge_connected");
+export async function getBridgeStatus(): Promise<ConnectionStatus[]> {
+  return invoke("get_bridge_status");
 }
 
-export async function sendMessage(text: string): Promise<void> {
-  return invoke("send_message", { text });
+export async function sendMessage(
+  connectionId: string,
+  text: string
+): Promise<void> {
+  return invoke("send_message", { connectionId, text });
 }
 
-export async function sendFile(path: string): Promise<void> {
-  return invoke("send_file", { path });
+export async function sendFile(connectionId: string, path: string): Promise<void> {
+  return invoke("send_file", { connectionId, path });
 }
 
 export async function getHistory(
+  connectionId: string,
   limit: number,
   beforeId?: string
 ): Promise<ChatMessage[]> {
-  return invoke("get_history", { limit, beforeId: beforeId ?? null });
+  return invoke("get_history", { connectionId, limit, beforeId: beforeId ?? null });
 }
 
-export async function clearHistory(): Promise<void> {
-  return invoke("clear_history");
+export async function clearHistory(connectionId?: string): Promise<void> {
+  return invoke("clear_history", { connectionId: connectionId ?? null });
 }
 
 export async function setAlwaysOnTop(on: boolean): Promise<void> {

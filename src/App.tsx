@@ -11,13 +11,22 @@ import {
   loadConfig,
   saveConfig,
   connectBridge,
-  getBridgeConnected,
+  getBridgeStatus,
   setMainWindowSize,
 } from "@/lib/commands";
 
 export default function App() {
-  const { config, setConfig, setConnected, setSettingsOpen, chatOpen, settingsOpen, contextMenuOpen } =
-    useAppStore();
+  const {
+    config,
+    setConfig,
+    setConnections,
+    setConnectionStatus,
+    setActiveConnectionId,
+    setSettingsOpen,
+    chatOpen,
+    settingsOpen,
+    contextMenuOpen,
+  } = useAppStore();
   const { notice, clearNotice } = useAutoUpdateCheck();
 
   useTauriEvents();
@@ -26,26 +35,40 @@ export default function App() {
     loadConfig()
       .then((cfg) => {
         setConfig(cfg);
-        if (cfg.bridge?.token) {
-          connectBridge()
-            .then(async () => {
-              for (let i = 0; i < 8; i++) {
-                const ok = await getBridgeConnected().catch(() => false);
-                if (ok) {
-                  setConnected(true);
-                  return;
-                }
-                await new Promise((r) => setTimeout(r, 300));
-              }
-            })
-            .catch(console.error);
+        setConnections(cfg.bridges ?? []);
+        if (cfg.bridges?.length) {
+          setActiveConnectionId(cfg.bridges[0].id);
         }
-        if (!cfg.bridge?.token?.trim()) {
+        for (const bridge of cfg.bridges ?? []) {
+          if (bridge.token?.trim()) {
+            connectBridge(bridge.id).catch(console.error);
+          }
+        }
+        if (!cfg.bridges?.length) {
           setSettingsOpen(true);
         }
       })
       .catch(console.error);
-  }, [setConfig, setConnected, setSettingsOpen]);
+  }, [setConfig, setConnections, setActiveConnectionId, setSettingsOpen]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const timer = setInterval(() => {
+      getBridgeStatus()
+        .then((statuses) => {
+          if (cancelled) return;
+          for (const status of statuses) {
+            setConnectionStatus(status.id, status.connected);
+          }
+        })
+        .catch(() => undefined);
+    }, 1200);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [setConnectionStatus]);
 
   const petSize = config?.pet.size ?? 120;
   const chatW = config?.pet.chatWindowWidth ?? 480;

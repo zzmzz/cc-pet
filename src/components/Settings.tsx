@@ -8,14 +8,33 @@ import {
   setAlwaysOnTop,
   setWindowOpacity,
 } from "@/lib/commands";
-import type { AppConfig, PetAppearance } from "@/lib/types";
+import type { AppConfig, BridgeConfig, PetAppearance } from "@/lib/types";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 
+function createBridge(): BridgeConfig {
+  return {
+    id: crypto.randomUUID(),
+    name: "新连接",
+    host: "127.0.0.1",
+    port: 9810,
+    token: "",
+    platformName: "desktop-pet",
+    userId: "pet-user",
+  };
+}
+
 export function Settings() {
-  const { settingsOpen, setSettingsOpen, config, setConfig } = useAppStore();
+  const {
+    settingsOpen,
+    setSettingsOpen,
+    config,
+    setConfig,
+    setConnections,
+    connections,
+  } = useAppStore();
   const [form, setForm] = useState<AppConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [tab, setTab] = useState<"bridge" | "pet">("bridge");
@@ -86,18 +105,57 @@ export function Settings() {
     });
   };
 
+  const updateBridge = (
+    index: number,
+    field: keyof BridgeConfig,
+    value: string | number
+  ) => {
+    setForm((prev) => {
+      if (!prev) return prev;
+      const next = JSON.parse(JSON.stringify(prev)) as AppConfig;
+      next.bridges[index][field] = value as never;
+      return next;
+    });
+  };
+
+  const addBridge = () => {
+    setForm((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        bridges: [...prev.bridges, createBridge()],
+      };
+    });
+  };
+
+  const removeBridge = (id: string) => {
+    setForm((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        bridges: prev.bridges.filter((b) => b.id !== id),
+      };
+    });
+  };
+
   const handleSave = async () => {
     if (!form) return;
     setSaving(true);
     try {
       await saveConfig(form);
       setConfig(form);
+      setConnections(form.bridges);
       await setAlwaysOnTop(form.pet.alwaysOnTop);
       await setWindowOpacity(form.pet.chatWindowOpacity);
-      // Reload bridge connection immediately after settings change.
-      await disconnectBridge().catch(() => undefined);
-      if (form.bridge.token.trim()) {
-        await connectBridge().catch(console.error);
+
+      const oldIds = Object.keys(connections);
+      for (const id of oldIds) {
+        await disconnectBridge(id).catch(() => undefined);
+      }
+      for (const bridge of form.bridges) {
+        if (bridge.token.trim()) {
+          await connectBridge(bridge.id).catch(console.error);
+        }
       }
       setSettingsOpen(false);
     } catch (e) {
@@ -175,36 +233,67 @@ export function Settings() {
                 <h3 className="text-sm font-semibold text-gray-700 mb-3">
                   cc-connect Bridge
                 </h3>
-                <div className="space-y-3">
-                  <Field
-                    label="Host"
-                    value={form.bridge.host}
-                    onChange={(v) => update("bridge.host", v)}
-                  />
-                  <Field
-                    label="Port"
-                    value={String(form.bridge.port)}
-                    onChange={(v) =>
-                      update("bridge.port", parseInt(v) || 9810)
-                    }
-                    type="number"
-                  />
-                  <Field
-                    label="Token"
-                    value={form.bridge.token}
-                    onChange={(v) => update("bridge.token", v)}
-                    type="password"
-                  />
-                  <Field
-                    label="Platform Name"
-                    value={form.bridge.platformName}
-                    onChange={(v) => update("bridge.platformName", v)}
-                  />
-                  <Field
-                    label="User ID"
-                    value={form.bridge.userId}
-                    onChange={(v) => update("bridge.userId", v)}
-                  />
+                <div className="space-y-4">
+                  {form.bridges.map((bridge, index) => (
+                    <div
+                      key={bridge.id}
+                      className="rounded-xl border border-gray-200 p-3 space-y-3"
+                    >
+                      <div className="flex items-center gap-2">
+                        <input
+                          value={bridge.name}
+                          onChange={(e) =>
+                            updateBridge(index, "name", e.target.value)
+                          }
+                          className="flex-1 border border-gray-200 rounded-lg px-3 py-1.5 text-sm outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+                          placeholder="连接名称"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => removeBridge(bridge.id)}
+                          className="text-xs px-2 py-1 rounded text-red-500 hover:bg-red-50"
+                        >
+                          删除
+                        </button>
+                      </div>
+                      <Field
+                        label="Host"
+                        value={bridge.host}
+                        onChange={(v) => updateBridge(index, "host", v)}
+                      />
+                      <Field
+                        label="Port"
+                        value={String(bridge.port)}
+                        onChange={(v) =>
+                          updateBridge(index, "port", parseInt(v) || 9810)
+                        }
+                        type="number"
+                      />
+                      <Field
+                        label="Token"
+                        value={bridge.token}
+                        onChange={(v) => updateBridge(index, "token", v)}
+                        type="password"
+                      />
+                      <Field
+                        label="Platform Name"
+                        value={bridge.platformName}
+                        onChange={(v) => updateBridge(index, "platformName", v)}
+                      />
+                      <Field
+                        label="User ID"
+                        value={bridge.userId}
+                        onChange={(v) => updateBridge(index, "userId", v)}
+                      />
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={addBridge}
+                    className="text-xs px-3 py-1.5 rounded-lg bg-indigo-50 text-indigo-600 hover:bg-indigo-100"
+                  >
+                    + 添加连接
+                  </button>
                 </div>
                 <p className="text-[11px] text-gray-400 mt-2">
                   需要在 cc-connect 的 config.toml 中启用 [bridge] 并设置 port

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
-    pub bridge: BridgeConfig,
+    pub bridges: Vec<BridgeConfig>,
     pub pet: PetConfig,
     #[serde(default)]
     pub llm: LlmConfig,
@@ -14,6 +14,8 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeConfig {
+    pub id: String,
+    pub name: String,
     pub host: String,
     pub port: u16,
     pub token: String,
@@ -68,15 +70,37 @@ pub struct LlmConfig {
     pub enabled: bool,
 }
 
+// --- TOML deserialization structs (new format with [[bridges]]) ---
+
 #[derive(Debug, Deserialize)]
-struct TomlConfig {
-    bridge: TomlBridge,
+struct TomlConfigNew {
+    bridges: Vec<TomlBridgeNew>,
     pet: Option<TomlPet>,
     llm: Option<TomlLlm>,
 }
 
 #[derive(Debug, Deserialize)]
-struct TomlBridge {
+struct TomlBridgeNew {
+    id: Option<String>,
+    name: Option<String>,
+    host: Option<String>,
+    port: u16,
+    token: String,
+    platform_name: Option<String>,
+    user_id: Option<String>,
+}
+
+// --- TOML deserialization structs (legacy format with [bridge]) ---
+
+#[derive(Debug, Deserialize)]
+struct TomlConfigLegacy {
+    bridge: TomlBridgeLegacy,
+    pet: Option<TomlPet>,
+    llm: Option<TomlLlm>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlBridgeLegacy {
     host: Option<String>,
     port: u16,
     token: String,
@@ -132,8 +156,8 @@ fn toml_single_quoted(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-fn parse_pet_and_llm(pet: Option<TomlPet>, llm: Option<TomlLlm>) -> (PetConfig, LlmConfig) {
-    let pet = pet.unwrap_or(TomlPet {
+fn parse_pet_and_llm(pet_opt: Option<TomlPet>, llm_opt: Option<TomlLlm>) -> (PetConfig, LlmConfig) {
+    let pet = pet_opt.unwrap_or(TomlPet {
         size: None,
         always_on_top: None,
         chat_window_opacity: None,
@@ -141,7 +165,7 @@ fn parse_pet_and_llm(pet: Option<TomlPet>, llm: Option<TomlLlm>) -> (PetConfig, 
         chat_window_height: None,
         appearance: None,
     });
-    let llm = llm.unwrap_or(TomlLlm {
+    let llm = llm_opt.unwrap_or(TomlLlm {
         api_url: None,
         api_key: None,
         model: None,
@@ -156,22 +180,23 @@ fn parse_pet_and_llm(pet: Option<TomlPet>, llm: Option<TomlLlm>) -> (PetConfig, 
         happy: non_empty(app_toml.happy),
         error: non_empty(app_toml.error),
     };
-    let pet_cfg = PetConfig {
-        size: pet.size.unwrap_or(120),
-        always_on_top: pet.always_on_top.unwrap_or(true),
-        chat_window_opacity: pet.chat_window_opacity.unwrap_or(0.95),
-        chat_window_width: pet.chat_window_width.unwrap_or(480.0),
-        chat_window_height: pet.chat_window_height.unwrap_or(640.0),
-        appearance,
-    };
-    let llm_cfg = LlmConfig {
-        api_url: llm.api_url.unwrap_or_default(),
-        api_key: llm.api_key.unwrap_or_default(),
-        model: llm.model.unwrap_or_default(),
-        image_model: llm.image_model,
-        enabled: llm.enabled.unwrap_or(false),
-    };
-    (pet_cfg, llm_cfg)
+    (
+        PetConfig {
+            size: pet.size.unwrap_or(120),
+            always_on_top: pet.always_on_top.unwrap_or(true),
+            chat_window_opacity: pet.chat_window_opacity.unwrap_or(0.95),
+            chat_window_width: pet.chat_window_width.unwrap_or(480.0),
+            chat_window_height: pet.chat_window_height.unwrap_or(640.0),
+            appearance,
+        },
+        LlmConfig {
+            api_url: llm.api_url.unwrap_or_default(),
+            api_key: llm.api_key.unwrap_or_default(),
+            model: llm.model.unwrap_or_default(),
+            image_model: llm.image_model,
+            enabled: llm.enabled.unwrap_or(false),
+        },
+    )
 }
 
 pub fn load_config() -> Result<AppConfig, String> {
@@ -180,22 +205,66 @@ pub fn load_config() -> Result<AppConfig, String> {
         return Ok(default_config());
     }
     let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let toml: TomlConfig = toml::from_str(&text).map_err(|e| e.to_string())?;
-    let (pet, llm) = parse_pet_and_llm(toml.pet, toml.llm);
+    // Try new format first ([[bridges]] array of tables)
+    if let Ok(toml_new) = toml::from_str::<TomlConfigNew>(&text) {
+        let bridges: Vec<BridgeConfig> = toml_new
+            .bridges
+            .into_iter()
+            .map(|b| BridgeConfig {
+                id: b.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                name: b.name.unwrap_or_else(|| "默认连接".into()),
+                host: b.host.unwrap_or_else(|| "127.0.0.1".into()),
+                port: b.port,
+                token: b.token,
+                platform_name: b.platform_name.unwrap_or_else(|| "desktop-pet".into()),
+                user_id: b.user_id.unwrap_or_else(|| "pet-user".into()),
+            })
+            .collect();
+        let (pet_cfg, llm_cfg) = parse_pet_and_llm(toml_new.pet, toml_new.llm);
+        return Ok(AppConfig {
+            bridges,
+            pet: pet_cfg,
+            llm: llm_cfg,
+        });
+    }
+
+    // Fall back to legacy format ([bridge] single table)
+    let toml_legacy: TomlConfigLegacy = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let bridge = BridgeConfig {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: "默认连接".into(),
+        host: toml_legacy.bridge.host.unwrap_or_else(|| "127.0.0.1".into()),
+        port: toml_legacy.bridge.port,
+        token: toml_legacy.bridge.token,
+        platform_name: toml_legacy.bridge.platform_name.unwrap_or_else(|| "desktop-pet".into()),
+        user_id: toml_legacy.bridge.user_id.unwrap_or_else(|| "pet-user".into()),
+    };
+    let (pet_cfg, llm_cfg) = parse_pet_and_llm(toml_legacy.pet, toml_legacy.llm);
     Ok(AppConfig {
-        bridge: BridgeConfig {
-            host: toml.bridge.host.unwrap_or_else(|| "127.0.0.1".into()),
-            port: toml.bridge.port,
-            token: toml.bridge.token,
-            platform_name: toml.bridge.platform_name.unwrap_or_else(|| "desktop-pet".into()),
-            user_id: toml.bridge.user_id.unwrap_or_else(|| "pet-user".into()),
-        },
-        pet,
-        llm,
+        bridges: vec![bridge],
+        pet: pet_cfg,
+        llm: llm_cfg,
     })
 }
 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
+    let mut bridges_block = String::new();
+    for b in &config.bridges {
+        bridges_block.push_str(&format!(
+            r#"[[bridges]]
+id = "{}"
+name = "{}"
+host = "{}"
+port = {}
+token = "{}"
+platform_name = "{}"
+user_id = "{}"
+
+"#,
+            b.id, b.name, b.host, b.port, b.token, b.platform_name, b.user_id
+        ));
+    }
+
     let image_model_line = match &config.llm.image_model {
         Some(m) if !m.is_empty() => format!("image_model = \"{}\"", m),
         _ => String::new(),
@@ -223,14 +292,7 @@ pub fn save_config(config: &AppConfig) -> Result<(), String> {
         format!("\n[pet.appearance]\n{}", appearance_block)
     };
     let content = format!(
-        r#"[bridge]
-host = "{}"
-port = {}
-token = "{}"
-platform_name = "{}"
-user_id = "{}"
-
-[pet]
+        r#"{}[pet]
 size = {}
 always_on_top = {}
 chat_window_opacity = {}
@@ -244,11 +306,7 @@ model = "{}"
 {}
 enabled = {}
 "#,
-        config.bridge.host,
-        config.bridge.port,
-        config.bridge.token,
-        config.bridge.platform_name,
-        config.bridge.user_id,
+        bridges_block,
         config.pet.size,
         config.pet.always_on_top,
         config.pet.chat_window_opacity,
@@ -267,13 +325,7 @@ enabled = {}
 
 fn default_config() -> AppConfig {
     AppConfig {
-        bridge: BridgeConfig {
-            host: "127.0.0.1".into(),
-            port: 9810,
-            token: String::new(),
-            platform_name: "desktop-pet".into(),
-            user_id: "pet-user".into(),
-        },
+        bridges: vec![],
         pet: PetConfig {
             size: 120,
             always_on_top: true,

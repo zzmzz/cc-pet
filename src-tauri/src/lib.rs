@@ -4,7 +4,9 @@ mod history;
 mod llm;
 mod update;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
+use serde::Serialize;
 use tauri::{Emitter, LogicalSize, Manager, Size};
 use tokio::sync::Mutex;
 
@@ -14,11 +16,19 @@ use history::{ChatHistory, ChatMessage};
 use llm::LlmMessage;
 
 struct AppState {
-    bridge: Mutex<Option<BridgeClient>>,
+    bridges: Mutex<HashMap<String, BridgeClient>>,
     bridge_connect_lock: Mutex<()>,
     history: ChatHistory,
     config: Mutex<AppConfig>,
     tray: StdMutex<Option<tauri::tray::TrayIcon>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeStatus {
+    id: String,
+    name: String,
+    connected: bool,
 }
 
 #[tauri::command]
@@ -35,63 +45,79 @@ async fn save_config(config: AppConfig, state: tauri::State<'_, Arc<AppState>>) 
 
 #[tauri::command]
 async fn connect_bridge(
+    connection_id: String,
     state: tauri::State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     let _connect_guard = state.bridge_connect_lock.lock().await;
     let cfg = state.config.lock().await.clone();
-    if cfg.bridge.token.is_empty() {
+    let bridge_cfg = cfg
+        .bridges
+        .iter()
+        .find(|b| b.id == connection_id)
+        .cloned()
+        .ok_or_else(|| format!("Bridge not found: {connection_id}"))?;
+    if bridge_cfg.token.trim().is_empty() {
         return Err("Token is empty — configure Bridge first".into());
     }
-    {
-        let guard = state.bridge.lock().await;
-        if guard.is_some() {
-            eprintln!("[bridge] connect requested but client already exists; skip");
-            return Ok(());
-        }
-    }
-    let prev = {
-        let mut guard = state.bridge.lock().await;
-        guard.take()
+
+    let existing = {
+        let mut guard = state.bridges.lock().await;
+        guard.remove(&connection_id)
     };
-    if let Some(prev) = prev {
-        eprintln!("[bridge] stopping previous client before reconnect");
+    if let Some(prev) = existing {
+        eprintln!("[bridge] reconnect: stop previous client id={connection_id}");
         prev.stop().await;
     }
+
     eprintln!(
-        "[bridge] starting client host={} port={} platform={}",
-        cfg.bridge.host, cfg.bridge.port, cfg.bridge.platform_name
+        "[bridge] starting client id={} host={} port={} platform={}",
+        connection_id, bridge_cfg.host, bridge_cfg.port, bridge_cfg.platform_name
     );
-    let client = BridgeClient::start(cfg.bridge, app);
-    *state.bridge.lock().await = Some(client);
+    let client = BridgeClient::start(connection_id.clone(), bridge_cfg, app);
+    state.bridges.lock().await.insert(connection_id, client);
     Ok(())
 }
 
 #[tauri::command]
-async fn disconnect_bridge(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn disconnect_bridge(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     let _connect_guard = state.bridge_connect_lock.lock().await;
-    if let Some(client) = state.bridge.lock().await.as_ref() {
+    let client = state.bridges.lock().await.remove(&connection_id);
+    if let Some(client) = client {
         eprintln!("[bridge] disconnect requested");
         client.stop().await;
     }
-    *state.bridge.lock().await = None;
     Ok(())
 }
 
 #[tauri::command]
-async fn get_bridge_connected(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
-    let guard = state.bridge.lock().await;
-    Ok(guard.as_ref().map(|c| c.is_connected()).unwrap_or(false))
+async fn get_bridge_status(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<BridgeStatus>, String> {
+    let cfg = state.config.lock().await.clone();
+    let guard = state.bridges.lock().await;
+    let statuses = cfg
+        .bridges
+        .into_iter()
+        .map(|b| BridgeStatus {
+            id: b.id.clone(),
+            name: b.name.clone(),
+            connected: guard.get(&b.id).map(|c| c.is_connected()).unwrap_or(false),
+        })
+        .collect();
+    Ok(statuses)
 }
 
 #[tauri::command]
 async fn send_message(
+    connection_id: String,
     text: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     eprintln!("[bridge] send_message called, len={}", text.len());
-    let guard = state.bridge.lock().await;
-    let client = match guard.as_ref() {
+    let guard = state.bridges.lock().await;
+    let client = match guard.get(&connection_id) {
         Some(c) => c,
         None => {
             eprintln!("[bridge] send_message rejected: no active bridge client");
@@ -101,7 +127,7 @@ async fn send_message(
     // save to history
     let msg = ChatMessage {
         id: format!("user-{}", chrono::Utc::now().timestamp_millis()),
-        connection_id: String::new(),
+        connection_id: connection_id.clone(),
         role: "user".into(),
         content: text.clone(),
         content_type: "text".into(),
@@ -122,11 +148,12 @@ async fn send_message(
 
 #[tauri::command]
 async fn send_file(
+    connection_id: String,
     path: String,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    let guard = state.bridge.lock().await;
-    let client = match guard.as_ref() {
+    let guard = state.bridges.lock().await;
+    let client = match guard.get(&connection_id) {
         Some(c) => c,
         None => {
             eprintln!("[bridge] send_file rejected: no active bridge client");
@@ -139,7 +166,7 @@ async fn send_file(
         .unwrap_or_else(|| "file".into());
     let msg = ChatMessage {
         id: format!("file-{}", chrono::Utc::now().timestamp_millis()),
-        connection_id: String::new(),
+        connection_id,
         role: "user".into(),
         content: name,
         content_type: "file".into(),
@@ -154,16 +181,20 @@ async fn send_file(
 
 #[tauri::command]
 async fn get_history(
+    connection_id: String,
     limit: u32,
     before_id: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<ChatMessage>, String> {
-    state.history.recent("", limit, before_id.as_deref())
+    state.history.recent(&connection_id, limit, before_id.as_deref())
 }
 
 #[tauri::command]
-async fn clear_history(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.history.clear(None)
+async fn clear_history(
+    connection_id: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state.history.clear(connection_id.as_deref())
 }
 
 #[tauri::command]
@@ -290,13 +321,7 @@ async fn set_main_window_size(width: f64, height: f64, app: tauri::AppHandle) ->
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cfg = config::load_config().unwrap_or_else(|_| AppConfig {
-        bridge: config::BridgeConfig {
-            host: "127.0.0.1".into(),
-            port: 9810,
-            token: String::new(),
-            platform_name: "desktop-pet".into(),
-            user_id: "pet-user".into(),
-        },
+        bridges: vec![],
         pet: config::PetConfig {
             size: 120,
             always_on_top: true,
@@ -314,7 +339,7 @@ pub fn run() {
     });
 
     let state = Arc::new(AppState {
-        bridge: Mutex::new(None),
+        bridges: Mutex::new(HashMap::new()),
         bridge_connect_lock: Mutex::new(()),
         history,
         config: Mutex::new(cfg.clone()),
@@ -366,7 +391,7 @@ pub fn run() {
             save_config,
             connect_bridge,
             disconnect_bridge,
-            get_bridge_connected,
+            get_bridge_status,
             send_message,
             send_file,
             get_history,

@@ -2,6 +2,7 @@ export type PetState = "idle" | "thinking" | "talking" | "happy" | "error";
 
 export interface ChatMessage {
   id: string;
+  connectionId: string;
   role: "user" | "bot";
   content: string;
   contentType: "text" | "file" | "image";
@@ -10,6 +11,8 @@ export interface ChatMessage {
 }
 
 export interface BridgeConfig {
+  id: string;
+  name: string;
   host: string;
   port: number;
   token: string;
@@ -44,9 +47,15 @@ export interface LlmConfig {
 }
 
 export interface AppConfig {
-  bridge: BridgeConfig;
+  bridges: BridgeConfig[];
   pet: PetConfig;
   llm: LlmConfig;
+}
+
+export interface ConnectionStatus {
+  id: string;
+  name: string;
+  connected: boolean;
 }
 
 export type ChatMode = "bridge" | "llm";

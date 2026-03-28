@@ -8,7 +8,14 @@ import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "@/lib/store";
-import { sendMessage, sendFile, clearHistory, revealFile, connectBridge, disconnectBridge } from "@/lib/commands";
+import {
+  sendMessage,
+  sendFile,
+  clearHistory,
+  revealFile,
+  connectBridge,
+  disconnectBridge,
+} from "@/lib/commands";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ChatMessage } from "@/lib/types";
@@ -185,11 +192,13 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
 
 export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const {
-    messages,
+    messagesByConnection,
     chatOpen,
     setChatOpen,
     setSettingsOpen,
-    connected,
+    connections,
+    activeConnectionId,
+    setActiveConnectionId,
     addMessage,
     updateMessage,
     clearMessages,
@@ -201,7 +210,10 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const [input, setInput] = useState("");
   const [slashIndex, setSlashIndex] = useState(0);
   const [updateChecking, setUpdateChecking] = useState(false);
-  const bridgeStreamBotIdRef = useRef<string | null>(null);
+  const bridgeStreamBotIdRef = useRef<Record<string, string | null>>({});
+  const messages = activeConnectionId
+    ? messagesByConnection[activeConnectionId] ?? []
+    : [];
 
   const { isActive: slashMenuVisible, query: slashQuery } = useSlashMenu(input);
 
@@ -220,54 +232,64 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     const unlistenFns: Array<() => void> = [];
 
     async function setup() {
-      const u3 = await listen<string>("bridge-stream-delta", (e) => {
-        if (cancelled) return;
-        const store = useAppStore.getState();
-        const delta = e.payload;
-        let id = bridgeStreamBotIdRef.current;
-        if (!id) {
-          id = `bot-bridge-${Date.now()}`;
-          bridgeStreamBotIdRef.current = id;
-          store.addMessage({
-            id,
-            role: "bot",
-            content: delta,
-            contentType: "text",
-            timestamp: Date.now(),
-          });
-          store.setPetState("talking");
-        } else {
-          const prev =
-            store.messages.find((m) => m.id === id)?.content || "";
-          store.updateMessage(id, { content: prev + delta });
+      const u3 = await listen<{ connectionId: string; delta: string }>(
+        "bridge-stream-delta",
+        (e) => {
+          if (cancelled) return;
+          const store = useAppStore.getState();
+          const { connectionId, delta } = e.payload;
+          let id = bridgeStreamBotIdRef.current[connectionId];
+          if (!id) {
+            id = `bot-bridge-${Date.now()}`;
+            bridgeStreamBotIdRef.current[connectionId] = id;
+            store.addMessage(connectionId, {
+              id,
+              connectionId,
+              role: "bot",
+              content: delta,
+              contentType: "text",
+              timestamp: Date.now(),
+            });
+            store.setPetState("talking");
+          } else {
+            const prev =
+              (store.messagesByConnection[connectionId] ?? []).find(
+                (m) => m.id === id
+              )?.content || "";
+            store.updateMessage(connectionId, id, { content: prev + delta });
+          }
         }
-      });
+      );
       if (cancelled) { u3(); return; }
       unlistenFns.push(u3);
 
-      const u4 = await listen<string>("bridge-stream-done", (e) => {
-        if (cancelled) return;
-        const store = useAppStore.getState();
-        const full = e.payload;
-        const id = bridgeStreamBotIdRef.current;
-        if (id) {
-          if (full.length > 0) {
-            store.updateMessage(id, { content: full });
+      const u4 = await listen<{ connectionId: string; fullText: string }>(
+        "bridge-stream-done",
+        (e) => {
+          if (cancelled) return;
+          const store = useAppStore.getState();
+          const { connectionId, fullText } = e.payload;
+          const id = bridgeStreamBotIdRef.current[connectionId];
+          if (id) {
+            if (fullText.length > 0) {
+              store.updateMessage(connectionId, id, { content: fullText });
+            }
+            bridgeStreamBotIdRef.current[connectionId] = null;
+          } else if (fullText.length > 0) {
+            store.addMessage(connectionId, {
+              id: `bot-${Date.now()}`,
+              connectionId,
+              role: "bot",
+              content: fullText,
+              contentType: "text",
+              timestamp: Date.now(),
+            });
+          } else {
+            bridgeStreamBotIdRef.current[connectionId] = null;
           }
-          bridgeStreamBotIdRef.current = null;
-        } else if (full.length > 0) {
-          store.addMessage({
-            id: `bot-${Date.now()}`,
-            role: "bot",
-            content: full,
-            contentType: "text",
-            timestamp: Date.now(),
-          });
-        } else {
-          bridgeStreamBotIdRef.current = null;
+          store.setPetState("idle");
         }
-        store.setPetState("idle");
-      });
+      );
       if (cancelled) { u4(); return; }
       unlistenFns.push(u4);
     }
@@ -281,35 +303,39 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   }, []);
 
   const handleSend = useCallback(async () => {
+    if (!activeConnectionId) return;
     const text = input.trim();
     if (!text) return;
     setInput("");
 
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
+      connectionId: activeConnectionId,
       role: "user",
       content: text,
       contentType: "text",
       timestamp: Date.now(),
     };
-    addMessage(userMsg);
+    addMessage(activeConnectionId, userMsg);
 
     setPetState("thinking");
     try {
-      await sendMessage(text);
+      await sendMessage(activeConnectionId, text);
     } catch (e) {
       console.error("send failed:", e);
       setPetState("error");
       setTimeout(() => setPetState("idle"), 3000);
     }
-  }, [input, addMessage, setPetState]);
+  }, [activeConnectionId, input, addMessage, setPetState]);
 
   const handleAttach = useCallback(async () => {
+    if (!activeConnectionId) return;
     const selected = await open({ multiple: false });
     if (selected) {
       const path = typeof selected === "string" ? selected : selected;
-      addMessage({
+      addMessage(activeConnectionId, {
         id: `file-${Date.now()}`,
+        connectionId: activeConnectionId,
         role: "user",
         content: String(path).split("/").pop() || "file",
         contentType: "file",
@@ -317,12 +343,12 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
         timestamp: Date.now(),
       });
       try {
-        await sendFile(String(path));
+        await sendFile(activeConnectionId, String(path));
       } catch (e) {
         console.error("send file failed:", e);
       }
     }
-  }, [addMessage]);
+  }, [activeConnectionId, addMessage]);
 
   const handleSlashSelect = useCallback(
     async (cmd: SlashCommand) => {
@@ -332,31 +358,39 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
       if (cmd.type === "local") {
         switch (cmd.command) {
           case "/clear":
-            clearHistory();
-            clearMessages();
+            if (activeConnectionId) {
+              clearHistory(activeConnectionId);
+              clearMessages(activeConnectionId);
+            }
             break;
           case "/settings":
             setSettingsOpen(true);
             break;
           case "/connect":
-            connectBridge().catch(console.error);
+            if (activeConnectionId) {
+              connectBridge(activeConnectionId).catch(console.error);
+            }
             break;
           case "/disconnect":
-            disconnectBridge().catch(console.error);
+            if (activeConnectionId) {
+              disconnectBridge(activeConnectionId).catch(console.error);
+            }
             break;
         }
       } else {
+        if (!activeConnectionId) return;
         const userMsg: ChatMessage = {
           id: `user-${Date.now()}`,
+          connectionId: activeConnectionId,
           role: "user",
           content: cmd.command,
           contentType: "text",
           timestamp: Date.now(),
         };
-        addMessage(userMsg);
+        addMessage(activeConnectionId, userMsg);
         setPetState("thinking");
         try {
-          await sendMessage(cmd.command);
+          await sendMessage(activeConnectionId, cmd.command);
         } catch (e) {
           console.error("send failed:", e);
           setPetState("error");
@@ -366,7 +400,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
 
       inputRef.current?.focus();
     },
-    [addMessage, setPetState, clearMessages, setSettingsOpen]
+    [activeConnectionId, addMessage, setPetState, clearMessages, setSettingsOpen]
   );
 
   const handleKeyDown = useCallback(
@@ -422,7 +456,10 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     setSlashIndex(0);
   }, [slashQuery]);
 
-  const isConnected = connected;
+  const isConnected = activeConnectionId
+    ? connections[activeConnectionId]?.connected ?? false
+    : false;
+  const bridgeList = Object.values(connections).map((entry) => entry.config);
 
   return (
     <AnimatePresence>
@@ -481,7 +518,12 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               设置
             </button>
             <button
-              onClick={() => { clearHistory(); clearMessages(); }}
+              onClick={() => {
+                if (activeConnectionId) {
+                  clearHistory(activeConnectionId);
+                  clearMessages(activeConnectionId);
+                }
+              }}
               className="text-[11px] text-gray-400 hover:text-red-500 transition-colors mr-2"
             >
               清空
@@ -491,6 +533,37 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               className="text-gray-400 hover:text-gray-600 transition-colors text-lg leading-none"
             >
               ✕
+            </button>
+          </div>
+          {/* Connection Tabs */}
+          <div className="flex items-center gap-1 px-2 py-1 border-b border-gray-100 overflow-x-auto">
+            {bridgeList.map((bridge) => {
+              const active = activeConnectionId === bridge.id;
+              const online = connections[bridge.id]?.connected ?? false;
+              return (
+                <button
+                  key={bridge.id}
+                  onClick={() => setActiveConnectionId(bridge.id)}
+                  className={`px-2.5 py-1 rounded-lg text-xs border transition-colors whitespace-nowrap ${
+                    active
+                      ? "bg-indigo-50 text-indigo-600 border-indigo-200"
+                      : "bg-white text-gray-500 border-gray-200 hover:border-gray-300"
+                  }`}
+                >
+                  <span
+                    className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${
+                      online ? "bg-green-500" : "bg-red-400"
+                    }`}
+                  />
+                  {bridge.name}
+                </button>
+              );
+            })}
+            <button
+              onClick={() => setSettingsOpen(true)}
+              className="px-2 py-1 rounded-lg text-xs text-gray-500 border border-gray-200 hover:bg-gray-50"
+            >
+              + 添加
             </button>
           </div>
 
@@ -534,7 +607,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               <div className="flex-1" />
               <button
                 onClick={handleSend}
-                disabled={!input.trim()}
+                disabled={!input.trim() || !activeConnectionId}
                 className="bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg px-5 py-1.5 transition-colors"
               >
                 发送
