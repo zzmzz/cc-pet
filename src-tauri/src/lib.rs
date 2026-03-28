@@ -101,6 +101,7 @@ async fn send_message(
     // save to history
     let msg = ChatMessage {
         id: format!("user-{}", chrono::Utc::now().timestamp_millis()),
+        connection_id: String::new(),
         role: "user".into(),
         content: text.clone(),
         content_type: "text".into(),
@@ -138,6 +139,7 @@ async fn send_file(
         .unwrap_or_else(|| "file".into());
     let msg = ChatMessage {
         id: format!("file-{}", chrono::Utc::now().timestamp_millis()),
+        connection_id: String::new(),
         role: "user".into(),
         content: name,
         content_type: "file".into(),
@@ -156,12 +158,12 @@ async fn get_history(
     before_id: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<Vec<ChatMessage>, String> {
-    state.history.recent(limit, before_id.as_deref())
+    state.history.recent("", limit, before_id.as_deref())
 }
 
 #[tauri::command]
 async fn clear_history(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.history.clear()
+    state.history.clear(None)
 }
 
 #[tauri::command]

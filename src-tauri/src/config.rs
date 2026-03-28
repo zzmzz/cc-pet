@@ -132,14 +132,8 @@ fn toml_single_quoted(s: &str) -> String {
     format!("'{escaped}'")
 }
 
-pub fn load_config() -> Result<AppConfig, String> {
-    let path = config_path();
-    if !path.exists() {
-        return Ok(default_config());
-    }
-    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let toml: TomlConfig = toml::from_str(&text).map_err(|e| e.to_string())?;
-    let pet = toml.pet.unwrap_or(TomlPet {
+fn parse_pet_and_llm(pet: Option<TomlPet>, llm: Option<TomlLlm>) -> (PetConfig, LlmConfig) {
+    let pet = pet.unwrap_or(TomlPet {
         size: None,
         always_on_top: None,
         chat_window_opacity: None,
@@ -147,7 +141,7 @@ pub fn load_config() -> Result<AppConfig, String> {
         chat_window_height: None,
         appearance: None,
     });
-    let llm = toml.llm.unwrap_or(TomlLlm {
+    let llm = llm.unwrap_or(TomlLlm {
         api_url: None,
         api_key: None,
         model: None,
@@ -162,6 +156,32 @@ pub fn load_config() -> Result<AppConfig, String> {
         happy: non_empty(app_toml.happy),
         error: non_empty(app_toml.error),
     };
+    let pet_cfg = PetConfig {
+        size: pet.size.unwrap_or(120),
+        always_on_top: pet.always_on_top.unwrap_or(true),
+        chat_window_opacity: pet.chat_window_opacity.unwrap_or(0.95),
+        chat_window_width: pet.chat_window_width.unwrap_or(480.0),
+        chat_window_height: pet.chat_window_height.unwrap_or(640.0),
+        appearance,
+    };
+    let llm_cfg = LlmConfig {
+        api_url: llm.api_url.unwrap_or_default(),
+        api_key: llm.api_key.unwrap_or_default(),
+        model: llm.model.unwrap_or_default(),
+        image_model: llm.image_model,
+        enabled: llm.enabled.unwrap_or(false),
+    };
+    (pet_cfg, llm_cfg)
+}
+
+pub fn load_config() -> Result<AppConfig, String> {
+    let path = config_path();
+    if !path.exists() {
+        return Ok(default_config());
+    }
+    let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let toml: TomlConfig = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let (pet, llm) = parse_pet_and_llm(toml.pet, toml.llm);
     Ok(AppConfig {
         bridge: BridgeConfig {
             host: toml.bridge.host.unwrap_or_else(|| "127.0.0.1".into()),
@@ -170,21 +190,8 @@ pub fn load_config() -> Result<AppConfig, String> {
             platform_name: toml.bridge.platform_name.unwrap_or_else(|| "desktop-pet".into()),
             user_id: toml.bridge.user_id.unwrap_or_else(|| "pet-user".into()),
         },
-        pet: PetConfig {
-            size: pet.size.unwrap_or(120),
-            always_on_top: pet.always_on_top.unwrap_or(true),
-            chat_window_opacity: pet.chat_window_opacity.unwrap_or(0.95),
-            chat_window_width: pet.chat_window_width.unwrap_or(480.0),
-            chat_window_height: pet.chat_window_height.unwrap_or(640.0),
-            appearance,
-        },
-        llm: LlmConfig {
-            api_url: llm.api_url.unwrap_or_default(),
-            api_key: llm.api_key.unwrap_or_default(),
-            model: llm.model.unwrap_or_default(),
-            image_model: llm.image_model,
-            enabled: llm.enabled.unwrap_or(false),
-        },
+        pet,
+        llm,
     })
 }
 
@@ -276,5 +283,62 @@ fn default_config() -> AppConfig {
             appearance: PetAppearanceConfig::default(),
         },
         llm: LlmConfig::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_empty_filters_whitespace_only() {
+        assert_eq!(non_empty(None), None);
+        assert_eq!(non_empty(Some("".into())), None);
+        assert_eq!(non_empty(Some("   \t\n".into())), None);
+        assert_eq!(non_empty(Some(" x ".into())), Some(" x ".into()));
+    }
+
+    #[test]
+    fn toml_single_quoted_escapes_apostrophe() {
+        assert_eq!(toml_single_quoted("a'b"), "'a''b'");
+        assert_eq!(toml_single_quoted(""), "''");
+        assert_eq!(toml_single_quoted("plain"), "'plain'");
+    }
+
+    #[test]
+    fn parse_pet_and_llm_defaults_when_inputs_none() {
+        let (pet, llm) = parse_pet_and_llm(None, None);
+        assert_eq!(pet.size, 120);
+        assert!(pet.always_on_top);
+        assert!((pet.chat_window_opacity - 0.95).abs() < f64::EPSILON);
+        assert!((pet.chat_window_width - 480.0).abs() < f64::EPSILON);
+        assert!((pet.chat_window_height - 640.0).abs() < f64::EPSILON);
+        assert!(pet.appearance.idle.is_none());
+        assert!(llm.api_url.is_empty());
+        assert!(!llm.enabled);
+    }
+
+    #[test]
+    fn parse_pet_and_llm_filters_blank_appearance_strings() {
+        let pet = TomlPet {
+            size: None,
+            always_on_top: None,
+            chat_window_opacity: None,
+            chat_window_width: None,
+            chat_window_height: None,
+            appearance: Some(TomlPetAppearance {
+                idle: Some("   ".into()),
+                thinking: Some("ok".into()),
+                talking: None,
+                happy: Some("".into()),
+                error: Some("\n\t".into()),
+            }),
+        };
+        let (pet_cfg, _) = parse_pet_and_llm(Some(pet), None);
+        assert!(pet_cfg.appearance.idle.is_none());
+        assert_eq!(pet_cfg.appearance.thinking.as_deref(), Some("ok"));
+        assert!(pet_cfg.appearance.talking.is_none());
+        assert!(pet_cfg.appearance.happy.is_none());
+        assert!(pet_cfg.appearance.error.is_none());
     }
 }

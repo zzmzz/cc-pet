@@ -494,6 +494,7 @@ fn handle_message(val: &Value, app: &tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn test_cfg() -> BridgeConfig {
         BridgeConfig {
@@ -522,10 +523,50 @@ mod tests {
     }
 
     #[test]
+    fn normalize_host_leaves_standard_ipv4_unchanged() {
+        assert_eq!(normalize_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(normalize_host("192.168.0.1"), "192.168.0.1");
+        assert_eq!(normalize_host("8.8.8.8"), "8.8.8.8");
+    }
+
+    #[test]
+    fn normalize_host_keeps_invalid_or_unusual_segments_as_is() {
+        assert_eq!(normalize_host("127..1"), "127..1");
+        assert_eq!(normalize_host("a.b.c"), "a.b.c");
+        assert_eq!(normalize_host("1.2.3.4.5"), "1.2.3.4.5");
+        assert_eq!(normalize_host("256.0.1"), "256.0.1");
+        assert_eq!(normalize_host("1.2.999"), "1.2.999");
+    }
+
+    #[test]
+    fn normalize_host_trims_whitespace_for_three_segment_rule() {
+        assert_eq!(normalize_host("  127.0.01  "), "127.0.0.1");
+    }
+
+    #[test]
     fn register_payload_has_required_fields() {
         let v: Value = serde_json::from_str(&make_register("desktop-pet")).unwrap();
         assert_eq!(v["type"], "register");
         assert_eq!(v["platform"], "desktop-pet");
+    }
+
+    #[test]
+    fn register_payload_has_capabilities_and_metadata() {
+        let v: Value = serde_json::from_str(&make_register("my-platform")).unwrap();
+        let caps = v["capabilities"].as_array().expect("capabilities array");
+        let cap_set: HashSet<_> = caps.iter().filter_map(|x| x.as_str()).collect();
+        assert!(cap_set.contains("text"));
+        assert!(cap_set.contains("buttons"));
+        assert!(cap_set.contains("file"));
+        let meta = v["metadata"].as_object().expect("metadata object");
+        assert_eq!(meta.get("protocol_version").and_then(|x| x.as_u64()), Some(1));
+        assert!(meta.get("version").and_then(|x| x.as_str()).unwrap_or("").len() > 0);
+        assert!(meta
+            .get("description")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .len()
+            > 0);
     }
 
     #[test]
@@ -534,5 +575,64 @@ mod tests {
         assert_eq!(v["type"], "message");
         assert_eq!(v["content"], "hello");
         assert_eq!(v["session_key"], "desktop-pet:pet-user:pet-user");
+    }
+
+    #[test]
+    fn make_message_json_includes_type_content_and_session_key() {
+        let cfg = test_cfg();
+        let raw = make_message("ping 测试", &cfg);
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("message"));
+        assert_eq!(v.get("content").and_then(|x| x.as_str()), Some("ping 测试"));
+        assert_eq!(
+            v.get("session_key").and_then(|x| x.as_str()),
+            Some("desktop-pet:pet-user:pet-user")
+        );
+    }
+
+    #[test]
+    fn reply_stream_chunk_extracts_delta_string() {
+        let v: Value = serde_json::from_str(r#"{"delta":"a"}"#).unwrap();
+        assert_eq!(reply_stream_chunk(&v), Some("a".to_string()));
+    }
+
+    #[test]
+    fn reply_stream_chunk_extracts_delta_content() {
+        let v: Value = serde_json::from_str(r#"{"delta":{"content":"b"}}"#).unwrap();
+        assert_eq!(reply_stream_chunk(&v), Some("b".to_string()));
+    }
+
+    #[test]
+    fn reply_stream_chunk_extracts_chunk() {
+        let v: Value = serde_json::from_str(r#"{"chunk":"c"}"#).unwrap();
+        assert_eq!(reply_stream_chunk(&v), Some("c".to_string()));
+    }
+
+    #[test]
+    fn reply_stream_chunk_extracts_data_variants() {
+        let a: Value = serde_json::from_str(r#"{"data":{"delta":"x"}}"#).unwrap();
+        let b: Value = serde_json::from_str(r#"{"data":{"content":"y"}}"#).unwrap();
+        let c: Value = serde_json::from_str(r#"{"data":{"text":"z"}}"#).unwrap();
+        let d: Value = serde_json::from_str(r#"{"data":{"delta":{"content":"k"}}}"#).unwrap();
+        assert_eq!(reply_stream_chunk(&a), Some("x".to_string()));
+        assert_eq!(reply_stream_chunk(&b), Some("y".to_string()));
+        assert_eq!(reply_stream_chunk(&c), Some("z".to_string()));
+        assert_eq!(reply_stream_chunk(&d), Some("k".to_string()));
+    }
+
+    #[test]
+    fn reply_stream_chunk_falls_back_to_top_level_text_and_content() {
+        let a: Value = serde_json::from_str(r#"{"text":"t"}"#).unwrap();
+        let b: Value = serde_json::from_str(r#"{"content":"u"}"#).unwrap();
+        assert_eq!(reply_stream_chunk(&a), Some("t".to_string()));
+        assert_eq!(reply_stream_chunk(&b), Some("u".to_string()));
+    }
+
+    #[test]
+    fn reply_stream_chunk_returns_none_when_no_text_like_field() {
+        let done: Value = serde_json::from_str(r#"{"done":true}"#).unwrap();
+        let empty: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(reply_stream_chunk(&done), None);
+        assert_eq!(reply_stream_chunk(&empty), None);
     }
 }

@@ -93,6 +93,9 @@ npm run tauri build
 ## Bridge 单元测试
 
 ```bash
+# 运行前端单元测试（Vitest）
+npm run test:run
+
 # 运行 Rust Bridge 单元测试（URL 编码、消息结构）
 cargo test --manifest-path src-tauri/Cargo.toml bridge::
 ```
