@@ -3,7 +3,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Pet } from "@/components/Pet";
 import { ChatWindow } from "@/components/ChatWindow";
 import { Settings } from "@/components/Settings";
+import { UpdateNotice } from "@/components/UpdateNotice";
 import { useTauriEvents } from "@/hooks/useTauriEvents";
+import { useAutoUpdateCheck } from "@/hooks/useAutoUpdateCheck";
 import { useAppStore } from "@/lib/store";
 import {
   loadConfig,
@@ -16,6 +18,7 @@ import {
 export default function App() {
   const { config, setConfig, setConnected, setSettingsOpen, chatOpen, settingsOpen, contextMenuOpen } =
     useAppStore();
+  const { notice, clearNotice } = useAutoUpdateCheck();
 
   useTauriEvents();
 
@@ -96,6 +99,13 @@ export default function App() {
 
   return (
     <div className="w-screen h-screen relative overflow-hidden bg-transparent">
+      {notice ? (
+        <UpdateNotice
+          latestVersion={notice.latestVersion}
+          releaseUrl={notice.releaseUrl}
+          onDismiss={clearNotice}
+        />
+      ) : null}
       <Pet size={petSize} />
       <ChatWindow petSize={petSize} />
       <Settings />

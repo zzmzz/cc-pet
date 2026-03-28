@@ -55,3 +55,11 @@ export interface LlmMessage {
   role: string;
   content: string;
 }
+
+export interface UpdateCheckResult {
+  currentVersion: string;
+  latestVersion: string;
+  updateAvailable: boolean;
+  releaseUrl: string;
+  releaseNotes?: string;
+}

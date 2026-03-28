@@ -1,6 +1,6 @@
 [package]
 name = "cc-pet"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Desktop pet connecting to cc-connect via Bridge WebSocket"
 license = "MIT"
@@ -27,6 +27,7 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json", "stream", "native-tls"] }
+semver = "1"
 log = "0.4"
 chrono = "0.4"
 dirs = "6"

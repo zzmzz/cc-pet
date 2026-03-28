@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppConfig, ChatMessage, LlmMessage } from "./types";
+import type { AppConfig, ChatMessage, LlmMessage, UpdateCheckResult } from "./types";
 
 export async function loadConfig(): Promise<AppConfig> {
   return invoke("load_config");
@@ -69,4 +69,8 @@ export async function revealFile(path: string): Promise<void> {
 
 export async function quitApp(): Promise<void> {
   return invoke("quit_app");
+}
+
+export async function checkForUpdates(): Promise<UpdateCheckResult> {
+  return invoke("check_for_updates");
 }

@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useAppStore } from "@/lib/store";
+import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 
 export function useTauriEvents() {
   const { setConnected, setPetState, addMessage, setChatOpen, setSettingsOpen } =
@@ -78,6 +79,13 @@ export function useTauriEvents() {
       });
       if (cancelled) { u5(); return; }
       unlistenFns.push(u5);
+
+      const u6 = await listen("manual-check-updates", () => {
+        if (cancelled) return;
+        void runManualUpdateCheckWithDialogs();
+      });
+      if (cancelled) { u6(); return; }
+      unlistenFns.push(u6);
     }
 
     setup();

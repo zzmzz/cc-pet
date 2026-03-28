@@ -9,6 +9,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "@/lib/store";
 import { sendMessage, sendFile, clearHistory, revealFile, connectBridge, disconnectBridge } from "@/lib/commands";
+import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ChatMessage } from "@/lib/types";
 import { SlashCommandMenu, useSlashMenu, getFilteredCommands } from "./SlashCommandMenu";
@@ -199,6 +200,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [input, setInput] = useState("");
   const [slashIndex, setSlashIndex] = useState(0);
+  const [updateChecking, setUpdateChecking] = useState(false);
   const bridgeStreamBotIdRef = useRef<string | null>(null);
 
   const { isActive: slashMenuVisible, query: slashQuery } = useSlashMenu(input);
@@ -454,6 +456,24 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               {isConnected ? "已连接" : "未连接"}
             </span>
             <div className="flex-1" data-tauri-drag-region />
+            <button
+              type="button"
+              title="检查更新"
+              disabled={updateChecking}
+              onClick={() => {
+                void (async () => {
+                  setUpdateChecking(true);
+                  try {
+                    await runManualUpdateCheckWithDialogs();
+                  } finally {
+                    setUpdateChecking(false);
+                  }
+                })();
+              }}
+              className="text-[11px] text-gray-400 hover:text-indigo-500 transition-colors mr-2 disabled:opacity-50"
+            >
+              {updateChecking ? "…" : "更新"}
+            </button>
             <button
               onClick={() => setSettingsOpen(true)}
               className="text-[11px] text-gray-400 hover:text-indigo-500 transition-colors mr-2"

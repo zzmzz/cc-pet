@@ -2,6 +2,7 @@ mod bridge;
 mod config;
 mod history;
 mod llm;
+mod update;
 
 use std::sync::{Arc, Mutex as StdMutex};
 use tauri::{Emitter, LogicalSize, Manager, Size};
@@ -253,6 +254,11 @@ async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn check_for_updates() -> Result<update::UpdateCheckResult, String> {
+    update::check_github_update(env!("CARGO_PKG_VERSION")).await
+}
+
+#[tauri::command]
 async fn set_main_window_size(width: f64, height: f64, app: tauri::AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("main") {
         let scale = win.scale_factor().unwrap_or(1.0);
@@ -370,6 +376,7 @@ pub fn run() {
             llm_generate_image,
             reveal_file,
             quit_app,
+            check_for_updates,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| {
@@ -388,6 +395,9 @@ fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), Strin
     let settings = MenuItemBuilder::with_id("settings", "设置")
         .build(app)
         .map_err(|e| e.to_string())?;
+    let check_update = MenuItemBuilder::with_id("check_update", "检查更新")
+        .build(app)
+        .map_err(|e| e.to_string())?;
     let quit = MenuItemBuilder::with_id("quit", "退出")
         .build(app)
         .map_err(|e| e.to_string())?;
@@ -396,6 +406,7 @@ fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), Strin
         .item(&chat)
         .separator()
         .item(&settings)
+        .item(&check_update)
         .separator()
         .item(&quit)
         .build()
@@ -418,6 +429,13 @@ fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), Strin
             }
             "settings" => {
                 let _ = app.emit("toggle-settings", ());
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+            "check_update" => {
+                let _ = app.emit("manual-check-updates", ());
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.show();
                     let _ = win.set_focus();

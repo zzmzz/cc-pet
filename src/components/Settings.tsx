@@ -10,19 +10,30 @@ import {
 } from "@/lib/commands";
 import type { AppConfig, PetAppearance } from "@/lib/types";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 
 export function Settings() {
   const { settingsOpen, setSettingsOpen, config, setConfig } = useAppStore();
   const [form, setForm] = useState<AppConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [tab, setTab] = useState<"bridge" | "pet">("bridge");
+  const [appVersion, setAppVersion] = useState("");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
 
   useEffect(() => {
     if (config && settingsOpen) {
       setForm(JSON.parse(JSON.stringify(config)));
     }
   }, [config, settingsOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion("—"));
+  }, [settingsOpen]);
 
   if (!form) return null;
 
@@ -302,6 +313,35 @@ export function Settings() {
                 </div>
               </section>
             )}
+          </div>
+
+          <div className="border-t border-gray-100 px-5 py-3 space-y-2 shrink-0 bg-gray-50/50">
+            <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+              关于
+            </h3>
+            <p className="text-sm text-gray-600">
+              当前版本{" "}
+              <span className="font-mono text-gray-800">
+                {appVersion || "…"}
+              </span>
+            </p>
+            <button
+              type="button"
+              disabled={checkingUpdate}
+              onClick={() => {
+                void (async () => {
+                  setCheckingUpdate(true);
+                  try {
+                    await runManualUpdateCheckWithDialogs();
+                  } finally {
+                    setCheckingUpdate(false);
+                  }
+                })();
+              }}
+              className="text-xs px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 disabled:opacity-50"
+            >
+              {checkingUpdate ? "检查中…" : "检查更新"}
+            </button>
           </div>
 
           {/* Actions */}
