@@ -63,6 +63,10 @@ export async function llmGenerateImage(prompt: string): Promise<string> {
   return invoke("llm_generate_image", { prompt });
 }
 
+export async function revealFile(path: string): Promise<void> {
+  return invoke("reveal_file", { path });
+}
+
 export async function quitApp(): Promise<void> {
   return invoke("quit_app");
 }

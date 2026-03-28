@@ -8,21 +8,59 @@ import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "@/lib/store";
-import { sendMessage, sendFile, clearHistory } from "@/lib/commands";
+import { sendMessage, sendFile, clearHistory, revealFile } from "@/lib/commands";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ChatMessage } from "@/lib/types";
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(() => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }, [text]);
+
+  return (
+    <button
+      onClick={handleCopy}
+      className="code-copy-btn"
+      title="复制代码"
+    >
+      {copied ? "✓ 已复制" : "复制"}
+    </button>
+  );
+}
 
 function MessageBubble({ msg }: { msg: ChatMessage }) {
   const isUser = msg.role === "user";
 
   if (msg.contentType === "file") {
+    const canOpen = !isUser && msg.filePath;
     return (
       <div
         className={`flex ${isUser ? "justify-end" : "justify-start"} px-3 py-1`}
       >
-        <div className="bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 text-blue-700 text-sm flex items-center gap-2 max-w-[80%]">
-          <span>📎</span>
-          <span className="truncate">{msg.filePath || msg.content}</span>
+        <div
+          className={`${
+            isUser
+              ? "bg-blue-50 border-blue-200 text-blue-700"
+              : "bg-green-50 border-green-200 text-green-700"
+          } border rounded-lg px-3 py-2 text-sm flex items-center gap-2 max-w-[80%] ${
+            canOpen ? "cursor-pointer hover:brightness-95 active:brightness-90 transition-all" : ""
+          }`}
+          onClick={() => {
+            if (canOpen) {
+              revealFile(msg.filePath!).catch(console.error);
+            }
+          }}
+        >
+          <span>{isUser ? "📎" : "📥"}</span>
+          <span className="truncate">{msg.filePath ? msg.filePath.split(/[/\\]/).pop() : msg.content}</span>
+          {canOpen && (
+            <span className="text-[10px] text-green-500 whitespace-nowrap">点击打开</span>
+          )}
         </div>
       </div>
     );
@@ -62,7 +100,7 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
       className={`flex ${isUser ? "justify-end" : "justify-start"} px-3 py-1`}
     >
       <div
-        className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-[13.5px] leading-relaxed ${
+        className={`max-w-[85%] min-w-0 overflow-hidden rounded-2xl px-4 py-2.5 text-[13.5px] leading-relaxed ${
           isUser
             ? "bg-indigo-500 text-white rounded-br-md"
             : "bg-gray-100 text-gray-800 rounded-bl-md markdown-body"
@@ -80,18 +118,25 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
                 const codeStr = String(children).replace(/\n$/, "");
                 if (match) {
                   return (
-                    <SyntaxHighlighter
-                      style={oneDark}
-                      language={match[1]}
-                      PreTag="div"
-                      customStyle={{
-                        borderRadius: "8px",
-                        margin: "6px 0",
-                        fontSize: "12.5px",
-                      }}
-                    >
-                      {codeStr}
-                    </SyntaxHighlighter>
+                    <div className="code-block-wrapper">
+                      <div className="code-block-header">
+                        <span className="code-block-lang">{match[1]}</span>
+                        <CopyButton text={codeStr} />
+                      </div>
+                      <SyntaxHighlighter
+                        style={oneDark}
+                        language={match[1]}
+                        PreTag="div"
+                        wrapLongLines
+                        customStyle={{
+                          borderRadius: "0 0 8px 8px",
+                          margin: 0,
+                          fontSize: "12.5px",
+                        }}
+                      >
+                        {codeStr}
+                      </SyntaxHighlighter>
+                    </div>
                   );
                 }
                 return (
@@ -117,7 +162,7 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
               },
             }}
           >
-            {msg.content}
+            {msg.content.replace(/\n/g, "  \n")}
           </ReactMarkdown>
         )}
         <div
@@ -144,6 +189,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     connected,
     addMessage,
     updateMessage,
+    clearMessages,
     setPetState,
   } = useAppStore();
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -272,7 +318,10 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      if (e.key === "Enter") {
+        if (e.ctrlKey || e.shiftKey || e.metaKey) {
+          return;
+        }
         e.preventDefault();
         handleSend();
       }
@@ -324,7 +373,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               设置
             </button>
             <button
-              onClick={() => clearHistory()}
+              onClick={() => { clearHistory(); clearMessages(); }}
               className="text-[11px] text-gray-400 hover:text-red-500 transition-colors mr-2"
             >
               清空
@@ -356,7 +405,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="输入消息，Ctrl+Enter 发送…"
+              placeholder="输入消息，Enter 发送，Shift+Enter 换行"
               className="w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-4 py-2.5 text-[13.5px] outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 transition-all placeholder:text-gray-400"
               rows={3}
             />

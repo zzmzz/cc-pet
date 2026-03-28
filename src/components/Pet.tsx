@@ -397,17 +397,27 @@ export function Pet({ size = 120 }: { size?: number }) {
     }
   }, [petState, controls]);
 
-  const handleDoubleClick = useCallback(() => {
-    setChatOpen(!chatOpen);
-  }, [setChatOpen, chatOpen]);
+  const lastMouseDownRef = useRef<number>(0);
+  const DOUBLE_CLICK_THRESHOLD = 400;
 
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
       if (e.button !== 0) return;
+
+      const now = Date.now();
+      const elapsed = now - lastMouseDownRef.current;
+      lastMouseDownRef.current = now;
+
+      if (elapsed < DOUBLE_CLICK_THRESHOLD) {
+        lastMouseDownRef.current = 0;
+        setChatOpen(!chatOpen);
+        return;
+      }
+
       e.preventDefault();
       getCurrentWindow().startDragging().catch(console.error);
     },
-    []
+    [setChatOpen, chatOpen]
   );
 
   const handleContextMenu = useCallback(
@@ -430,7 +440,6 @@ export function Pet({ size = 120 }: { size?: number }) {
         className="cursor-grab active:cursor-grabbing absolute bottom-0 left-0 z-50"
         animate={controls}
         onMouseDown={handleMouseDown}
-        onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
         style={{ width: s, height: s }}
       >

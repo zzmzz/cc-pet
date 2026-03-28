@@ -30,6 +30,8 @@ export interface PetConfig {
   size: number;
   alwaysOnTop: boolean;
   chatWindowOpacity: number;
+  chatWindowWidth: number;
+  chatWindowHeight: number;
   appearance?: PetAppearance;
 }
 

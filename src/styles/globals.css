@@ -30,6 +30,11 @@ body {
   user-select: none;
 }
 
+.markdown-body,
+.markdown-body * {
+  user-select: text;
+}
+
 /* Custom scrollbar */
 ::-webkit-scrollbar {
   width: 5px;
@@ -45,6 +50,53 @@ body {
   background: rgba(var(--text-secondary), 0.5);
 }
 
+.markdown-body {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Code block wrapper with header + copy button */
+.code-block-wrapper {
+  border-radius: 8px;
+  margin: 6px 0;
+  overflow: hidden;
+  background: #1e1e2e;
+}
+
+.code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 12px;
+  background: #16161e;
+  font-size: 11px;
+}
+
+.code-block-lang {
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+}
+
+.code-copy-btn {
+  color: #aaa;
+  background: transparent;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+  user-select: none;
+}
+
+.code-copy-btn:hover {
+  color: #fff;
+  border-color: #555;
+  background: #2a2a3e;
+}
+
 /* Markdown code blocks */
 .markdown-body pre {
   background: #1e1e2e;
@@ -52,6 +104,8 @@ body {
   padding: 12px 14px;
   overflow-x: auto;
   margin: 6px 0;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 .markdown-body code {
   font-family: "JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas,

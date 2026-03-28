@@ -112,14 +112,93 @@ fn make_register(platform: &str) -> String {
     json!({
         "type": "register",
         "platform": platform,
-        "capabilities": ["text", "buttons"],
+        "capabilities": ["text", "buttons", "file"],
         "metadata": {
-            "version": "0.4.0",
+            "version": "0.5.0",
             "protocol_version": 1,
             "description": "CC Pet desktop (Tauri)"
         }
     })
     .to_string()
+}
+
+fn downloads_dir() -> std::path::PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = home.join(".cc-pet").join("downloads");
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            _ => c,
+        })
+        .collect();
+    let trimmed = sanitized.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        "file".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn save_attachment(attachment: &Value) -> Option<(String, String)> {
+    let raw_name = attachment
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("file");
+    let safe_name = sanitize_filename(raw_name);
+
+    let data_str = attachment.get("data").and_then(|v| v.as_str())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_str)
+        .ok()?;
+
+    let dir = downloads_dir();
+    let mut path = dir.join(&safe_name);
+
+    if path.exists() {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = path
+            .extension()
+            .map(|s| format!(".{}", s.to_string_lossy()))
+            .unwrap_or_default();
+        let ts = chrono::Utc::now().timestamp_millis();
+        path = dir.join(format!("{}_{}{}", stem, ts, ext));
+    }
+
+    std::fs::write(&path, &bytes).ok()?;
+    eprintln!(
+        "[bridge] saved attachment: {} ({} bytes) -> {}",
+        safe_name,
+        bytes.len(),
+        path.display()
+    );
+    Some((safe_name, path.to_string_lossy().to_string()))
+}
+
+fn handle_attachments(val: &Value, app: &tauri::AppHandle) {
+    let attachments = val
+        .get("attachments")
+        .or_else(|| val.get("data").and_then(|d| d.get("attachments")))
+        .and_then(|v| v.as_array());
+
+    if let Some(atts) = attachments {
+        for att in atts {
+            if let Some((name, path)) = save_attachment(att) {
+                let _ = app.emit(
+                    "bridge-file-received",
+                    json!({ "name": name, "path": path }),
+                );
+            }
+        }
+    }
 }
 
 fn make_message(text: &str, cfg: &BridgeConfig) -> String {
@@ -360,6 +439,7 @@ fn handle_message(val: &Value, app: &tauri::AppHandle) {
                     let _ = app.emit("bridge-message", content.to_string());
                 }
             }
+            handle_attachments(val, app);
         }
         "reply_stream" => {
             let done = val.get("done").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -382,6 +462,7 @@ fn handle_message(val: &Value, app: &tauri::AppHandle) {
                     eprintln!("[bridge] emit bridge-stream-done empty");
                     let _ = app.emit("bridge-stream-done", String::new());
                 }
+                handle_attachments(val, app);
             } else if let Some(chunk) = reply_stream_chunk(val) {
                 if !chunk.is_empty() {
                     eprintln!("[bridge] emit bridge-stream-delta len={}", chunk.len());

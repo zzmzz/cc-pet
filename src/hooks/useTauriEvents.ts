@@ -37,6 +37,25 @@ export function useTauriEvents() {
       if (cancelled) { u2(); return; }
       unlistenFns.push(u2);
 
+      const u2b = await listen<{ name: string; path: string }>(
+        "bridge-file-received",
+        (e) => {
+          if (cancelled) return;
+          setPetState("happy");
+          addMessage({
+            id: `bot-file-${Date.now()}`,
+            role: "bot",
+            content: e.payload.name,
+            contentType: "file",
+            filePath: e.payload.path,
+            timestamp: Date.now(),
+          });
+          setTimeout(() => setPetState("idle"), 3000);
+        }
+      );
+      if (cancelled) { u2b(); return; }
+      unlistenFns.push(u2b);
+
       const u3 = await listen<string>("bridge-error", (e) => {
         if (cancelled) return;
         setPetState("error");

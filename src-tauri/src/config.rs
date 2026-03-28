@@ -42,9 +42,16 @@ pub struct PetConfig {
     pub size: u32,
     pub always_on_top: bool,
     pub chat_window_opacity: f64,
+    #[serde(default = "default_chat_window_width")]
+    pub chat_window_width: f64,
+    #[serde(default = "default_chat_window_height")]
+    pub chat_window_height: f64,
     #[serde(default)]
     pub appearance: PetAppearanceConfig,
 }
+
+fn default_chat_window_width() -> f64 { 480.0 }
+fn default_chat_window_height() -> f64 { 640.0 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +89,8 @@ struct TomlPet {
     size: Option<u32>,
     always_on_top: Option<bool>,
     chat_window_opacity: Option<f64>,
+    chat_window_width: Option<f64>,
+    chat_window_height: Option<f64>,
     appearance: Option<TomlPetAppearance>,
 }
 
@@ -134,6 +143,8 @@ pub fn load_config() -> Result<AppConfig, String> {
         size: None,
         always_on_top: None,
         chat_window_opacity: None,
+        chat_window_width: None,
+        chat_window_height: None,
         appearance: None,
     });
     let llm = toml.llm.unwrap_or(TomlLlm {
@@ -163,6 +174,8 @@ pub fn load_config() -> Result<AppConfig, String> {
             size: pet.size.unwrap_or(120),
             always_on_top: pet.always_on_top.unwrap_or(true),
             chat_window_opacity: pet.chat_window_opacity.unwrap_or(0.95),
+            chat_window_width: pet.chat_window_width.unwrap_or(480.0),
+            chat_window_height: pet.chat_window_height.unwrap_or(640.0),
             appearance,
         },
         llm: LlmConfig {
@@ -213,7 +226,9 @@ user_id = "{}"
 [pet]
 size = {}
 always_on_top = {}
-chat_window_opacity = {}{}
+chat_window_opacity = {}
+chat_window_width = {}
+chat_window_height = {}{}
 
 [llm]
 api_url = "{}"
@@ -230,6 +245,8 @@ enabled = {}
         config.pet.size,
         config.pet.always_on_top,
         config.pet.chat_window_opacity,
+        config.pet.chat_window_width,
+        config.pet.chat_window_height,
         appearance_section,
         config.llm.api_url,
         config.llm.api_key,
@@ -254,6 +271,8 @@ fn default_config() -> AppConfig {
             size: 120,
             always_on_top: true,
             chat_window_opacity: 0.95,
+            chat_window_width: 480.0,
+            chat_window_height: 640.0,
             appearance: PetAppearanceConfig::default(),
         },
         llm: LlmConfig::default(),

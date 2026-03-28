@@ -210,6 +210,43 @@ async fn set_window_opacity(opacity: f64, app: tauri::AppHandle) -> Result<(), S
 }
 
 #[tauri::command]
+async fn reveal_file(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err("File not found".into());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(parent) = p.parent() {
+            std::process::Command::new("xdg-open")
+                .arg(parent)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
     app.exit(0);
     Ok(())
@@ -256,6 +293,8 @@ pub fn run() {
             size: 120,
             always_on_top: true,
             chat_window_opacity: 0.95,
+            chat_window_width: 480.0,
+            chat_window_height: 640.0,
             appearance: PetAppearanceConfig::default(),
         },
         llm: LlmConfig::default(),
@@ -302,6 +341,11 @@ pub fn run() {
                     }
                 }
 
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = win.set_shadow(false);
+                }
+
                 let _ = win.center();
                 let _ = win.show();
                 let _ = win.set_focus();
@@ -324,6 +368,7 @@ pub fn run() {
             set_main_window_size,
             llm_chat,
             llm_generate_image,
+            reveal_file,
             quit_app,
         ])
         .run(tauri::generate_context!())
@@ -356,7 +401,11 @@ fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), Strin
         .build()
         .map_err(|e| e.to_string())?;
 
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))
+        .expect("failed to load tray icon");
+
     let tray = TrayIconBuilder::new()
+        .icon(icon)
         .tooltip("CC Pet")
         .menu(&menu)
         .on_menu_event(move |app, event| match event.id().as_ref() {
