@@ -6,6 +6,20 @@
 
 <p align="center">桌面宠物，通过 Bridge WebSocket 协议直连 <a href="https://github.com/chenhg5/cc-connect">cc-connect</a>，无需经过 Telegram 等第三方平台。</p>
 
+## 安装
+
+前往 [Releases](https://github.com/zzmzz/cc-pet/releases/latest) 页面，下载对应平台的安装包：
+
+| 平台 | 文件 |
+|------|------|
+| Windows | `cc-pet_x.x.x_x64-setup.exe` 或 `.msi` |
+| macOS (Apple Silicon) | `cc-pet_x.x.x_aarch64.dmg` |
+| macOS (Intel) | `cc-pet_x.x.x_x64.dmg` |
+| Linux (Debian/Ubuntu) | `cc-pet_x.x.x_amd64.deb` |
+| Linux (通用) | `cc-pet_x.x.x_amd64.AppImage` |
+
+下载后双击安装，首次运行会自动创建配置文件 `~/.cc-pet/config.toml`，在设置页面填入 Bridge 连接信息即可使用。
+
 ## 技术栈
 
 **Tauri v2** + **React** + **Tailwind CSS** + **Framer Motion** + **Rust**
@@ -64,7 +78,8 @@ npm run tauri build
 | 操作 | 效果 |
 |------|------|
 | 双击宠物 | 打开/关闭聊天窗口 |
-| Ctrl+Enter | 发送消息 |
+| Enter | 发送消息 |
+| Shift+Enter | 换行 |
 | 📎 按钮 | 上传文件 |
 | 系统托盘 | 打开聊天、设置、退出 |
 
