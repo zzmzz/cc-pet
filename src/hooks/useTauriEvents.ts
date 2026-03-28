@@ -3,15 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useAppStore, makeChatKey } from "@/lib/store";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 import { listBridgeSessions, getHistory } from "@/lib/commands";
-
-function sessionFromReplyCtx(replyCtx?: string): string | null {
-  if (!replyCtx) return null;
-  if (!replyCtx.startsWith("ccpet:")) return null;
-  const body = replyCtx.slice("ccpet:".length);
-  const idx = body.lastIndexOf(":");
-  if (idx <= 0) return null;
-  return body.slice(0, idx);
-}
+import { resolveIncomingSessionKey } from "@/lib/sessionRouting";
 
 export function useTauriEvents() {
   const {
@@ -25,6 +17,7 @@ export function useTauriEvents() {
     setMessages,
     setChatOpen,
     setSettingsOpen,
+    markSessionUnread,
   } = useAppStore();
 
   useEffect(() => {
@@ -32,6 +25,15 @@ export function useTauriEvents() {
     const unlistenFns: Array<() => void> = [];
 
     async function setup() {
+      const setIdleRespectUnread = () => {
+        const store = useAppStore.getState();
+        if (store.hasAnyUnread()) {
+          store.setPetState("talking");
+          return;
+        }
+        store.setPetState("idle");
+      };
+
       const u1 = await listen<{ connectionId: string; connected: boolean }>(
         "bridge-connected",
         (e) => {
@@ -39,7 +41,7 @@ export function useTauriEvents() {
           setConnectionStatus(e.payload.connectionId, e.payload.connected);
           setPetState(e.payload.connected ? "happy" : "idle");
           if (e.payload.connected) {
-            setTimeout(() => setPetState("idle"), 3000);
+            setTimeout(() => setIdleRespectUnread(), 3000);
             const connId = e.payload.connectionId;
             console.log("[sessions] bridge-connected, refreshing sessions for", connId);
             listBridgeSessions(connId)
@@ -80,17 +82,23 @@ export function useTauriEvents() {
           if (cancelled) return;
           const store = useAppStore.getState();
           const knownSessions = store.sessionsByConnection[e.payload.connectionId] ?? [];
-          const extractedKey = sessionFromReplyCtx(e.payload.replyCtx);
-          const sessionKey =
-            (extractedKey && (knownSessions.length === 0 || knownSessions.includes(extractedKey)) ? extractedKey : null) ||
-            store.activeSessionByConnection[e.payload.connectionId] ||
-            knownSessions[0] ||
-            "default";
+          const sessionKey = resolveIncomingSessionKey({
+            payloadSessionKey: e.payload.sessionKey,
+            replyCtx: e.payload.replyCtx,
+            knownSessions,
+            activeSessionKey: store.activeSessionByConnection[e.payload.connectionId],
+          });
+          const activeSession = store.activeSessionByConnection[e.payload.connectionId];
+          const shouldMarkUnread = !store.chatOpen || activeSession !== sessionKey;
           ensureSession(e.payload.connectionId, sessionKey);
           if (!store.activeSessionByConnection[e.payload.connectionId]) {
             setActiveSessionKey(e.payload.connectionId, sessionKey);
           }
-          setPetState("talking");
+          if (shouldMarkUnread) {
+            markSessionUnread(e.payload.connectionId, sessionKey);
+          } else {
+            setPetState("talking");
+          }
           addMessage(e.payload.connectionId, sessionKey, {
             id: `bot-${Date.now()}`,
             connectionId: e.payload.connectionId,
@@ -101,7 +109,7 @@ export function useTauriEvents() {
             contentType: "text",
             timestamp: Date.now(),
           });
-          setTimeout(() => setPetState("idle"), 4000);
+          setTimeout(() => setIdleRespectUnread(), 4000);
         }
       );
       if (cancelled) { u2(); return; }
@@ -113,14 +121,20 @@ export function useTauriEvents() {
           if (cancelled) return;
           const store = useAppStore.getState();
           const knownSessions = store.sessionsByConnection[e.payload.connectionId] ?? [];
-          const extractedKey = sessionFromReplyCtx(e.payload.replyCtx);
-          const sessionKey =
-            (extractedKey && (knownSessions.length === 0 || knownSessions.includes(extractedKey)) ? extractedKey : null) ||
-            store.activeSessionByConnection[e.payload.connectionId] ||
-            knownSessions[0] ||
-            "default";
+          const sessionKey = resolveIncomingSessionKey({
+            payloadSessionKey: e.payload.sessionKey,
+            replyCtx: e.payload.replyCtx,
+            knownSessions,
+            activeSessionKey: store.activeSessionByConnection[e.payload.connectionId],
+          });
+          const activeSession = store.activeSessionByConnection[e.payload.connectionId];
+          const shouldMarkUnread = !store.chatOpen || activeSession !== sessionKey;
           ensureSession(e.payload.connectionId, sessionKey);
-          setPetState("happy");
+          if (shouldMarkUnread) {
+            markSessionUnread(e.payload.connectionId, sessionKey);
+          } else {
+            setPetState("happy");
+          }
           addMessage(e.payload.connectionId, sessionKey, {
             id: `bot-file-${Date.now()}`,
             connectionId: e.payload.connectionId,
@@ -132,7 +146,7 @@ export function useTauriEvents() {
             filePath: e.payload.path,
             timestamp: Date.now(),
           });
-          setTimeout(() => setPetState("idle"), 3000);
+          setTimeout(() => setIdleRespectUnread(), 3000);
         }
       );
       if (cancelled) { u2b(); return; }
@@ -144,7 +158,7 @@ export function useTauriEvents() {
           if (cancelled) return;
           setPetState("error");
           console.error("bridge error:", e.payload.connectionId, e.payload.error);
-          setTimeout(() => setPetState("idle"), 3000);
+          setTimeout(() => setIdleRespectUnread(), 3000);
         }
       );
       if (cancelled) { u3(); return; }
@@ -178,5 +192,5 @@ export function useTauriEvents() {
       cancelled = true;
       unlistenFns.forEach((fn) => fn());
     };
-  }, [setConnectionStatus, setPetState, addMessage, ensureSession, setActiveSessionKey, setSessions, setSessionLabel, setMessages, setChatOpen, setSettingsOpen]);
+  }, [setConnectionStatus, setPetState, addMessage, ensureSession, setActiveSessionKey, setSessions, setSessionLabel, setMessages, setChatOpen, setSettingsOpen, markSessionUnread]);
 }

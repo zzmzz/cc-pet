@@ -39,12 +39,17 @@ interface AppStore {
   sessionsByConnection: Record<string, string[]>;
   sessionLabelsByConnection: Record<string, Record<string, string>>;
   sessionLastActiveByConnection: Record<string, Record<string, number>>;
+  sessionUnreadByConnection: Record<string, Record<string, number>>;
   setSessions: (connectionId: string, sessionIds: string[], activeId?: string) => void;
   setSessionLabel: (connectionId: string, sessionId: string, label: string) => void;
   setActiveSessionKey: (connectionId: string, sessionKey: string) => void;
   ensureSession: (connectionId: string, sessionKey: string) => void;
   removeSession: (connectionId: string, sessionId: string) => void;
   setSessionLastActiveMap: (connectionId: string, map: Record<string, number>) => void;
+  markSessionUnread: (connectionId: string, sessionId: string) => void;
+  clearSessionUnread: (connectionId: string, sessionId: string) => void;
+  clearAllUnreadForConnection: (connectionId: string) => void;
+  hasAnyUnread: () => boolean;
 
   // messages
   messagesByChat: Record<string, ChatMessage[]>;
@@ -76,7 +81,16 @@ interface AppStore {
 
 // ── Store ──────────────────────────────────────────────────────────────────────
 
-export const useAppStore = create<AppStore>((set) => ({
+function hasAnyUnreadInMap(unreadByConnection: Record<string, Record<string, number>>): boolean {
+  for (const unreadBySession of Object.values(unreadByConnection)) {
+    for (const count of Object.values(unreadBySession)) {
+      if (count > 0) return true;
+    }
+  }
+  return false;
+}
+
+export const useAppStore = create<AppStore>((set, get) => ({
   // ── connections ──
   connections: {},
   setConnections: (configs) =>
@@ -117,6 +131,7 @@ export const useAppStore = create<AppStore>((set) => ({
   sessionsByConnection: {},
   sessionLabelsByConnection: {},
   sessionLastActiveByConnection: {},
+  sessionUnreadByConnection: {},
 
   setSessions: (connectionId, sessionIds, activeId) =>
     set((state) => {
@@ -174,6 +189,58 @@ export const useAppStore = create<AppStore>((set) => ({
       },
     })),
 
+  markSessionUnread: (connectionId, sessionId) =>
+    set((state) => {
+      const prevByConnection = state.sessionUnreadByConnection[connectionId] ?? {};
+      const prevCount = prevByConnection[sessionId] ?? 0;
+      return {
+        sessionUnreadByConnection: {
+          ...state.sessionUnreadByConnection,
+          [connectionId]: {
+            ...prevByConnection,
+            [sessionId]: prevCount + 1,
+          },
+        },
+        petState: "talking",
+      };
+    }),
+
+  clearSessionUnread: (connectionId, sessionId) =>
+    set((state) => {
+      const prevByConnection = state.sessionUnreadByConnection[connectionId];
+      if (!prevByConnection || !prevByConnection[sessionId]) return state;
+
+      const nextByConnection = { ...prevByConnection };
+      delete nextByConnection[sessionId];
+
+      const nextUnread = { ...state.sessionUnreadByConnection };
+      if (Object.keys(nextByConnection).length === 0) {
+        delete nextUnread[connectionId];
+      } else {
+        nextUnread[connectionId] = nextByConnection;
+      }
+
+      const anyUnread = hasAnyUnreadInMap(nextUnread);
+      return {
+        sessionUnreadByConnection: nextUnread,
+        petState: !anyUnread && state.petState === "talking" ? "idle" : state.petState,
+      };
+    }),
+
+  clearAllUnreadForConnection: (connectionId) =>
+    set((state) => {
+      if (!state.sessionUnreadByConnection[connectionId]) return state;
+      const nextUnread = { ...state.sessionUnreadByConnection };
+      delete nextUnread[connectionId];
+      const anyUnread = hasAnyUnreadInMap(nextUnread);
+      return {
+        sessionUnreadByConnection: nextUnread,
+        petState: !anyUnread && state.petState === "talking" ? "idle" : state.petState,
+      };
+    }),
+
+  hasAnyUnread: () => hasAnyUnreadInMap(get().sessionUnreadByConnection),
+
   removeSession: (connectionId, sessionId) =>
     set((state) => {
       const sessions = (state.sessionsByConnection[connectionId] ?? []).filter(
@@ -186,9 +253,18 @@ export const useAppStore = create<AppStore>((set) => ({
       delete labels[sessionId];
       const lastActive = { ...(state.sessionLastActiveByConnection[connectionId] ?? {}) };
       delete lastActive[sessionId];
+      const unread = { ...(state.sessionUnreadByConnection[connectionId] ?? {}) };
+      delete unread[sessionId];
+      const nextUnreadByConnection = { ...state.sessionUnreadByConnection };
+      if (Object.keys(unread).length === 0) {
+        delete nextUnreadByConnection[connectionId];
+      } else {
+        nextUnreadByConnection[connectionId] = unread;
+      }
 
       const wasActive = state.activeSessionByConnection[connectionId] === sessionId;
       const newActive = wasActive ? sessions[0] ?? "" : state.activeSessionByConnection[connectionId];
+      const anyUnread = hasAnyUnreadInMap(nextUnreadByConnection);
 
       return {
         sessionsByConnection: { ...state.sessionsByConnection, [connectionId]: sessions },
@@ -198,6 +274,8 @@ export const useAppStore = create<AppStore>((set) => ({
         messagesByChat: restMessages,
         sessionLabelsByConnection: { ...state.sessionLabelsByConnection, [connectionId]: labels },
         sessionLastActiveByConnection: { ...state.sessionLastActiveByConnection, [connectionId]: lastActive },
+        sessionUnreadByConnection: nextUnreadByConnection,
+        petState: !anyUnread && state.petState === "talking" ? "idle" : state.petState,
       };
     }),
 

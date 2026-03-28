@@ -32,10 +32,13 @@ export function SessionDropdown() {
     sessionsByConnection,
     sessionLabelsByConnection,
     sessionLastActiveByConnection,
+    sessionUnreadByConnection,
     setSessions,
     setSessionLabel,
     setActiveSessionKey,
+    clearSessionUnread,
     removeSession,
+    hasAnyUnread,
   } = useAppStore();
   const [open, setOpen] = useState(false);
   const [showAll, setShowAll] = useState(false);
@@ -75,6 +78,12 @@ export function SessionDropdown() {
   const allSessions = sessionsByConnection[activeConnectionId] ?? [];
   const labels = sessionLabelsByConnection[activeConnectionId] ?? {};
   const lastActive = sessionLastActiveByConnection[activeConnectionId] ?? {};
+  const unread = sessionUnreadByConnection[activeConnectionId] ?? {};
+  const hasUnread = hasAnyUnread();
+  const totalUnread = Object.values(sessionUnreadByConnection).reduce(
+    (sum, bySession) => sum + Object.values(bySession).reduce((n, c) => n + c, 0),
+    0
+  );
 
   const activeLabel = activeSessionKey
     ? (labels[activeSessionKey] || activeSessionKey.split(":").pop() || activeSessionKey)
@@ -97,11 +106,16 @@ export function SessionDropdown() {
     return labels[sid] || sid.split(":").pop() || sid;
   }
 
+  function formatUnread(count: number): string {
+    return count > 99 ? "99+" : String(count);
+  }
+
   async function handleSwitch(sessionId: string) {
     setOpen(false);
     setShowAll(false);
     setConfirmDeleteId(null);
     setActiveSessionKey(activeConnectionId!, sessionId);
+    clearSessionUnread(activeConnectionId!, sessionId);
     switchBridgeSession(activeConnectionId!, sessionId).catch(console.error);
   }
 
@@ -192,6 +206,11 @@ export function SessionDropdown() {
         <span className="text-[12px] font-semibold text-gray-800 truncate">
           {buttonLabel}
         </span>
+        {hasUnread && (
+          <span className="inline-flex min-w-4 h-4 px-1 items-center justify-center rounded-full bg-red-500 text-white text-[9px] font-semibold leading-none flex-shrink-0">
+            {formatUnread(totalUnread)}
+          </span>
+        )}
         <span className="text-[9px] text-gray-400 flex-shrink-0">{open ? "▲" : "▼"}</span>
       </button>
 
@@ -243,6 +262,11 @@ export function SessionDropdown() {
                   <span className="text-[11px] text-indigo-700 font-medium truncate flex-1">
                     {activeLabel ?? "—"}
                   </span>
+                  {activeSessionKey && (unread[activeSessionKey] ?? 0) > 0 && (
+                    <span className="inline-flex min-w-4 h-4 px-1 items-center justify-center rounded-full bg-red-500 text-white text-[9px] font-semibold leading-none flex-shrink-0">
+                      {formatUnread(unread[activeSessionKey] ?? 0)}
+                    </span>
+                  )}
                   {activeSessionKey && lastActive[activeSessionKey] && confirmDeleteId !== activeSessionKey && (
                     <span className="text-[9px] text-indigo-300 flex-shrink-0 group-hover/active:hidden">
                       {formatTime(lastActive[activeSessionKey])}
@@ -269,6 +293,11 @@ export function SessionDropdown() {
                       <span className="text-[11px] text-gray-600 truncate flex-1">
                         {sessionLabelText(sid)}
                       </span>
+                      {(unread[sid] ?? 0) > 0 && (
+                        <span className="inline-flex min-w-4 h-4 px-1 items-center justify-center rounded-full bg-red-500 text-white text-[9px] font-semibold leading-none flex-shrink-0">
+                          {formatUnread(unread[sid] ?? 0)}
+                        </span>
+                      )}
                       {lastActive[sid] && confirmDeleteId !== sid && (
                         <span className="text-[9px] text-gray-300 flex-shrink-0 group-hover/item:hidden">
                           {formatTime(lastActive[sid])}

@@ -196,7 +196,7 @@ export function Settings() {
           animate={{ opacity: 1, scale: 1 }}
           exit={{ opacity: 0, scale: 0.9 }}
           transition={{ type: "spring", damping: 25, stiffness: 300 }}
-          className="fixed inset-0 flex flex-col bg-white/[0.98] backdrop-blur-sm rounded-2xl border border-gray-200 shadow-2xl overflow-hidden z-50"
+          className="fixed inset-0 flex flex-col bg-white/[0.98] backdrop-blur-sm rounded-2xl border border-gray-200 shadow-2xl overflow-hidden z-[70]"
           style={{ width: 480, height: 640 }}
         >
           {/* Title */}
@@ -244,7 +244,7 @@ export function Settings() {
             ))}
           </div>
 
-          <div className="flex-1 overflow-y-auto p-5 space-y-5">
+          <div className="flex-1 overflow-y-auto p-5 space-y-4">
             {/* Bridge Tab */}
             {tab === "bridge" && (
               <section>
@@ -420,35 +420,37 @@ export function Settings() {
                 </div>
               </section>
             )}
-          </div>
 
-          <div className="border-t border-gray-100 px-5 py-3 space-y-2 shrink-0 bg-gray-50/50">
-            <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
-              关于
-            </h3>
-            <p className="text-sm text-gray-600">
-              当前版本{" "}
-              <span className="font-mono text-gray-800">
-                {appVersion || "…"}
-              </span>
-            </p>
-            <button
-              type="button"
-              disabled={checkingUpdate}
-              onClick={() => {
-                void (async () => {
-                  setCheckingUpdate(true);
-                  try {
-                    await runManualUpdateCheckWithDialogs();
-                  } finally {
-                    setCheckingUpdate(false);
-                  }
-                })();
-              }}
-              className="text-xs px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 disabled:opacity-50"
-            >
-              {checkingUpdate ? "检查中…" : "检查更新"}
-            </button>
+            <section>
+              <div className="rounded-xl border border-gray-200 bg-gray-50/60 px-4 py-3 space-y-2">
+                <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                  关于
+                </h3>
+                <p className="text-sm text-gray-600">
+                  当前版本{" "}
+                  <span className="font-mono text-gray-800">
+                    {appVersion || "…"}
+                  </span>
+                </p>
+                <button
+                  type="button"
+                  disabled={checkingUpdate}
+                  onClick={() => {
+                    void (async () => {
+                      setCheckingUpdate(true);
+                      try {
+                        await runManualUpdateCheckWithDialogs();
+                      } finally {
+                        setCheckingUpdate(false);
+                      }
+                    })();
+                  }}
+                  className="text-xs px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-700 disabled:opacity-50"
+                >
+                  {checkingUpdate ? "检查中…" : "检查更新"}
+                </button>
+              </div>
+            </section>
           </div>
 
           {/* Actions */}

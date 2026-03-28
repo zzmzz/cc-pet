@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { clearHistory, getHistory, sendMessage, setWindowOpacity } from "./commands";
+import { clearHistory, fetchLinkPreview, getHistory, sendMessage, setWindowOpacity } from "./commands";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -42,6 +42,13 @@ describe("commands wrappers", () => {
     await setWindowOpacity(0.88);
     expect(invoke).toHaveBeenCalledWith("set_window_opacity", {
       opacity: 0.88,
+    });
+  });
+
+  it("maps fetchLinkPreview to fetch_link_preview invoke payload", async () => {
+    await fetchLinkPreview("https://ziiimo.cn/f/ce29");
+    expect(invoke).toHaveBeenCalledWith("fetch_link_preview", {
+      url: "https://ziiimo.cn/f/ce29",
     });
   });
 });

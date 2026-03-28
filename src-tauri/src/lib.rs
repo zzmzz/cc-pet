@@ -1,6 +1,7 @@
 mod bridge;
 mod config;
 pub mod history;
+mod link_preview;
 mod llm;
 mod update;
 
@@ -625,6 +626,11 @@ async fn check_for_updates() -> Result<update::UpdateCheckResult, String> {
 }
 
 #[tauri::command]
+async fn fetch_link_preview(url: String) -> Result<link_preview::LinkPreviewData, String> {
+    link_preview::fetch(&url).await
+}
+
+#[tauri::command]
 async fn set_main_window_size(width: f64, height: f64, app: tauri::AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("main") {
         let scale = win.scale_factor().unwrap_or(1.0);
@@ -736,6 +742,7 @@ pub fn run() {
             reveal_file,
             quit_app,
             check_for_updates,
+            fetch_link_preview,
             list_bridge_sessions,
             list_local_sessions,
             update_session_label,

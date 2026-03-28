@@ -155,6 +155,60 @@ body {
   text-decoration: underline;
 }
 
+.markdown-body .link-preview-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid #dbeafe;
+  border-radius: 10px;
+  background: #eff6ff;
+  color: #1e3a8a;
+  text-decoration: none;
+}
+
+.markdown-body .link-preview-card:hover {
+  text-decoration: none;
+  border-color: #93c5fd;
+  background: #e0edff;
+}
+
+.markdown-body .link-preview-card.file-link-card {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+  color: #14532d;
+}
+
+.markdown-body .link-preview-card.file-link-card:hover {
+  border-color: #86efac;
+  background: #dcfce7;
+}
+
+.link-preview-badge {
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.link-preview-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.link-preview-meta {
+  font-size: 11px;
+  opacity: 0.8;
+  word-break: break-word;
+}
+
+.link-preview-desc {
+  font-size: 12px;
+  color: #334155;
+  opacity: 0.95;
+  word-break: break-word;
+}
+
 /* ── Slash command menu ── */
 .slash-menu {
   position: absolute;

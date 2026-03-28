@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useCallback, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useCallback, useState, type ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -17,18 +17,192 @@ import {
   disconnectBridge,
   listBridgeSessions,
   getHistory,
+  fetchLinkPreview,
 } from "@/lib/commands";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ChatMessage } from "@/lib/types";
+import type { ChatMessage, LinkPreviewData } from "@/lib/types";
 import { SlashCommandMenu, useSlashMenu, getFilteredCommands } from "./SlashCommandMenu";
 import type { SlashCommand } from "./SlashCommandMenu";
 import { SessionDropdown } from "./SessionDropdown";
 
 const NEAR_BOTTOM_PX = 72;
+const FILE_LINK_EXTS = new Set([
+  "zip", "rar", "7z", "tar", "gz", "bz2",
+  "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv",
+  "png", "jpg", "jpeg", "gif", "webp", "svg", "mp4", "mp3", "wav",
+  "apk", "exe", "dmg", "msi",
+]);
+const LINK_PREVIEW_CACHE = new Map<string, LinkPreviewData | null>();
+const LINK_PREVIEW_INFLIGHT = new Map<string, Promise<LinkPreviewData | null>>();
 
 function isNearBottom(el: HTMLDivElement, threshold = NEAR_BOTTOM_PX) {
   return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+}
+
+function parseUrl(href?: string): URL | null {
+  const cleanedHref = normalizeHref(href);
+  if (!cleanedHref) return null;
+  try {
+    return new URL(cleanedHref);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeHref(href?: string): string {
+  if (!href) return "";
+  const trimmed = href.trim().replace(/(?:%20)+$/gi, "");
+  if (!trimmed) return "";
+  return splitUrlTrailingNote(trimmed)?.url ?? trimmed;
+}
+
+function getNodeText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (!node) return "";
+  if (Array.isArray(node)) return node.map((item) => getNodeText(item)).join("");
+  if (typeof node === "object" && "props" in node) {
+    const el = node as { props?: { children?: ReactNode } };
+    return getNodeText(el.props?.children);
+  }
+  return "";
+}
+
+function isFileLikeLink(url: URL): boolean {
+  const path = url.pathname || "";
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  if (FILE_LINK_EXTS.has(ext)) return true;
+  const q = url.search.toLowerCase();
+  return q.includes("download=") || q.includes("filename=");
+}
+
+function getDisplayFileName(url: URL): string {
+  const seg = decodeURIComponent(url.pathname.split("/").pop() || "").trim();
+  if (seg) return seg;
+  const filename = url.searchParams.get("filename");
+  if (filename) return filename;
+  return "下载文件";
+}
+
+function normalizeLinkDisplayText(text: string): string {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/\s+([（(\[【《])/g, "$1")
+    .replace(/([（(\[【《])\s+/g, "$1")
+    .replace(/\s+([）)\]】》])/g, "$1")
+    .trim();
+}
+
+function splitUrlTrailingNote(text: string): { url: string; note: string } | null {
+  if (!text.startsWith("http")) return null;
+  if (!text.endsWith("）")) return null;
+  const idx = text.lastIndexOf("（");
+  if (idx <= 0) return null;
+  const urlPart = text.slice(0, idx);
+  const note = text.slice(idx);
+  if (note.length > 40) return null;
+  if (!parseUrl(urlPart)) return null;
+  return { url: urlPart, note };
+}
+
+function getReadablePath(url: URL): string {
+  const pathname = normalizeLinkDisplayText(decodeURIComponent(url.pathname || "/"));
+  if (!pathname || pathname === "/") return "";
+  if (pathname.length <= 28) return pathname;
+  return `${pathname.slice(0, 25)}...`;
+}
+
+function getReadableLinkTitle(url: URL): string {
+  const host = url.hostname.replace(/^www\./, "");
+  const pathname = decodeURIComponent(url.pathname || "");
+  if (!pathname || pathname === "/") return host;
+  const last = pathname.split("/").filter(Boolean).pop() || "";
+  const fromLast = normalizeLinkDisplayText(last.replace(/[-_]+/g, " "));
+  if (fromLast) return fromLast;
+  return `${host}${getReadablePath(url)}`;
+}
+
+async function loadLinkPreview(url: string): Promise<LinkPreviewData | null> {
+  if (LINK_PREVIEW_CACHE.has(url)) {
+    return LINK_PREVIEW_CACHE.get(url) ?? null;
+  }
+  const existing = LINK_PREVIEW_INFLIGHT.get(url);
+  if (existing) return existing;
+  const task = fetchLinkPreview(url)
+    .then((data) => {
+      LINK_PREVIEW_CACHE.set(url, data);
+      LINK_PREVIEW_INFLIGHT.delete(url);
+      return data;
+    })
+    .catch(() => {
+      LINK_PREVIEW_CACHE.set(url, null);
+      LINK_PREVIEW_INFLIGHT.delete(url);
+      return null;
+    });
+  LINK_PREVIEW_INFLIGHT.set(url, task);
+  return task;
+}
+
+function LinkPreviewAnchor({ href, children }: { href?: string; children: ReactNode }) {
+  const normalizedHref = normalizeHref(href);
+  const parsed = parseUrl(normalizedHref);
+  if (!parsed || !normalizedHref) {
+    return <span>{children}</span>;
+  }
+  const childText = getNodeText(children).trim();
+  const isRawHref =
+    !childText ||
+    childText === href ||
+    childText === normalizedHref ||
+    childText === decodeURIComponent(href ?? "") ||
+    childText === decodeURIComponent(normalizedHref) ||
+    childText === parsed.toString();
+  const prettyTitle = getReadableLinkTitle(parsed);
+  const fallbackTitle = isRawHref ? prettyTitle : childText;
+  const fileLike = isFileLikeLink(parsed);
+  const [preview, setPreview] = useState<LinkPreviewData | null>(() => LINK_PREVIEW_CACHE.get(normalizedHref) ?? null);
+  const previewIndicatesFile = Boolean(preview?.isFile);
+
+  useEffect(() => {
+    if (fileLike) return;
+    let cancelled = false;
+    void loadLinkPreview(normalizedHref).then((data) => {
+      if (!cancelled) setPreview(data);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [normalizedHref, fileLike]);
+
+  if (fileLike || previewIndicatesFile) {
+    const effectiveUrl = parseUrl(preview?.finalUrl) ?? parsed;
+    const fileName = preview?.fileName?.trim() || getDisplayFileName(effectiveUrl);
+    const host = effectiveUrl.hostname.replace(/^www\./, "");
+    const fileTitle = preview?.title?.trim() || fileName || fallbackTitle;
+    return (
+      <a href={preview?.finalUrl || normalizedHref} download={fileName || true} className="link-preview-card file-link-card">
+        <span className="link-preview-badge">下载文件</span>
+        <span className="link-preview-title">{fileTitle}</span>
+        <span className="link-preview-meta">{fileName} · {host}</span>
+      </a>
+    );
+  }
+
+  const effectiveUrl = parseUrl(preview?.finalUrl) ?? parsed;
+  const title = preview?.title?.trim() || fallbackTitle;
+  const description = preview?.description?.trim() || "";
+  const siteName = preview?.siteName?.trim() || effectiveUrl.hostname.replace(/^www\./, "");
+
+  return (
+    <a href={normalizedHref} target="_blank" rel="noopener noreferrer" className="link-preview-card">
+      <span className="link-preview-title">{title}</span>
+      <span className="link-preview-meta">
+        {siteName}
+        {getReadablePath(effectiveUrl) ? ` · ${getReadablePath(effectiveUrl)}` : ""}
+      </span>
+      {description ? <span className="link-preview-desc">{description}</span> : null}
+    </a>
+  );
 }
 
 function CopyButton({ text }: { text: string }) {
@@ -168,16 +342,17 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
                 );
               },
               a({ href, children }) {
-                return (
-                  <a
-                    href={href}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-blue-600 hover:underline"
-                  >
-                    {children}
-                  </a>
-                );
+                const rawText = getNodeText(children).trim();
+                const trailingNote = splitUrlTrailingNote(rawText);
+                if (trailingNote) {
+                  return (
+                    <>
+                      <LinkPreviewAnchor href={trailingNote.url}>{trailingNote.url}</LinkPreviewAnchor>
+                      <span>{trailingNote.note}</span>
+                    </>
+                  );
+                }
+                return <LinkPreviewAnchor href={href}>{children}</LinkPreviewAnchor>;
               },
             }}
           >
@@ -213,6 +388,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     addMessage,
     updateMessage,
     clearMessages,
+    clearSessionUnread,
     setPetState,
     agentCommands,
   } = useAppStore();
@@ -326,6 +502,12 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
       .catch(() => undefined);
   }, [activeConnectionId, activeSessionKey, setMessages, messagesByChat]);
 
+  // 聊天打开且会话有效时，清除当前会话未读
+  useEffect(() => {
+    if (!chatOpen || !activeConnectionId || !activeSessionKey) return;
+    clearSessionUnread(activeConnectionId, activeSessionKey);
+  }, [chatOpen, activeConnectionId, activeSessionKey, clearSessionUnread]);
+
   useEffect(() => {
     let cancelled = false;
     const unlistenFns: Array<() => void> = [];
@@ -342,6 +524,11 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
         const { connectionId, sessionKey, delta } = e.payload;
         let id = bridgeStreamBotIdRef.current;
         if (!id) {
+          const activeSession = store.activeSessionByConnection[connectionId];
+          const shouldMarkUnread = !store.chatOpen || activeSession !== sessionKey;
+          if (shouldMarkUnread) {
+            store.markSessionUnread(connectionId, sessionKey);
+          }
           id = `bot-bridge-${Date.now()}`;
           bridgeStreamBotIdRef.current = id;
           store.addMessage(connectionId, sessionKey, {
@@ -353,7 +540,9 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
             contentType: "text",
             timestamp: Date.now(),
           });
-          store.setPetState("talking");
+          if (!shouldMarkUnread) {
+            store.setPetState("talking");
+          }
         } else {
           const chatKey = makeChatKey(connectionId, sessionKey);
           const prev =
@@ -380,6 +569,11 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
           }
           bridgeStreamBotIdRef.current = null;
         } else if (fullText.length > 0) {
+          const activeSession = store.activeSessionByConnection[connectionId];
+          const shouldMarkUnread = !store.chatOpen || activeSession !== sessionKey;
+          if (shouldMarkUnread) {
+            store.markSessionUnread(connectionId, sessionKey);
+          }
           store.addMessage(connectionId, sessionKey, {
             id: `bot-${Date.now()}`,
             connectionId,
@@ -392,7 +586,11 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
         } else {
           bridgeStreamBotIdRef.current = null;
         }
-        store.setPetState("idle");
+        if (store.hasAnyUnread()) {
+          store.setPetState("talking");
+        } else {
+          store.setPetState("idle");
+        }
       });
       if (cancelled) { u4(); return; }
       unlistenFns.push(u4);

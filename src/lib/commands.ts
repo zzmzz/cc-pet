@@ -7,6 +7,7 @@ import type {
   ConnectionStatus,
   BridgeSessionsData,
   LocalSessionsData,
+  LinkPreviewData,
 } from "./types";
 
 export async function loadConfig(): Promise<AppConfig> {
@@ -145,4 +146,8 @@ export async function quitApp(): Promise<void> {
 
 export async function checkForUpdates(): Promise<UpdateCheckResult> {
   return invoke("check_for_updates");
+}
+
+export async function fetchLinkPreview(url: string): Promise<LinkPreviewData> {
+  return invoke("fetch_link_preview", { url });
 }

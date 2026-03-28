@@ -99,3 +99,13 @@ export interface UpdateCheckResult {
   releaseUrl: string;
   releaseNotes?: string;
 }
+
+export interface LinkPreviewData {
+  url: string;
+  finalUrl: string;
+  title?: string;
+  description?: string;
+  siteName?: string;
+  isFile?: boolean;
+  fileName?: string;
+}
