@@ -60,6 +60,7 @@ vi.mock("@/lib/commands", () => ({
   downloadFileFromUrl: vi.fn(async () => "C:\\Users\\test\\Downloads\\app-v1.2.3.zip"),
   sendCardAction: vi.fn(async () => {}),
   sendFile: vi.fn(async () => {}),
+  sendFiles: vi.fn(async () => {}),
   clearHistory: vi.fn(async () => {}),
   revealFile: vi.fn(async () => {}),
   fetchLinkPreview: vi.fn(async (_url: string) => {

@@ -12,7 +12,7 @@ import {
   sendMessage,
   downloadFileFromUrl,
   sendCardAction,
-  sendFile,
+  sendFiles,
   clearHistory,
   revealFile,
   connectBridge,
@@ -363,6 +363,14 @@ function MessageBubble({
 
   if (msg.contentType === "file") {
     const canOpen = !isUser && msg.filePath;
+    const isRichUserFile =
+      isUser &&
+      (msg.content.includes("\n") || msg.content.startsWith("📎"));
+    const displayLabel = isRichUserFile
+      ? msg.content
+      : msg.filePath
+        ? msg.filePath.split(/[/\\]/).pop() ?? msg.content
+        : msg.content;
     return (
       <div
         className={`flex ${isUser ? "justify-end" : "justify-start"} px-3 py-1`}
@@ -372,7 +380,9 @@ function MessageBubble({
             isUser
               ? "bg-blue-50 border-blue-200 text-blue-700"
               : "bg-green-50 border-green-200 text-green-700"
-          } border rounded-lg px-3 py-2 text-sm flex items-center gap-2 max-w-[80%] ${
+          } border rounded-lg px-3 py-2 text-sm flex max-w-[80%] ${
+            isRichUserFile ? "items-start gap-2" : "items-center gap-2"
+          } ${
             canOpen ? "cursor-pointer hover:brightness-95 active:brightness-90 transition-all" : ""
           }`}
           onClick={() => {
@@ -381,10 +391,18 @@ function MessageBubble({
             }
           }}
         >
-          <span>{isUser ? "📎" : "📥"}</span>
-          <span className="truncate">{msg.filePath ? msg.filePath.split(/[/\\]/).pop() : msg.content}</span>
+          <span className={isRichUserFile ? "mt-0.5 shrink-0" : ""}>{isUser ? "📎" : "📥"}</span>
+          <span
+            className={
+              isRichUserFile
+                ? "whitespace-pre-wrap break-words text-left min-w-0"
+                : "truncate"
+            }
+          >
+            {displayLabel}
+          </span>
           {canOpen && (
-            <span className="text-[10px] text-green-500 whitespace-nowrap">点击打开</span>
+            <span className="text-[10px] text-green-500 whitespace-nowrap shrink-0 self-center">点击打开</span>
           )}
         </div>
       </div>
@@ -566,6 +584,8 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const stickToBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [input, setInput] = useState("");
+  /** 已选、尚未发送的本地文件路径（点「发送」时与输入框文字一起发出） */
+  const [pendingAttachmentPaths, setPendingAttachmentPaths] = useState<string[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [showJumpLatest, setShowJumpLatest] = useState(false);
@@ -1203,7 +1223,9 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
-    if (!text || !activeConnectionId || !activeSessionKey) return;
+    if (!activeConnectionId || !activeSessionKey) return;
+    if (!text && pendingAttachmentPaths.length === 0) return;
+
     const runLocalCommand = async (): Promise<boolean> => {
       switch (text) {
         case "/clear":
@@ -1224,33 +1246,72 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
           return false;
       }
     };
-    if (await runLocalCommand()) {
+
+    const paths = pendingAttachmentPaths;
+
+    if (paths.length === 0) {
+      if (!text) return;
+      if (await runLocalCommand()) {
+        setInput("");
+        inputRef.current?.focus();
+        return;
+      }
       setInput("");
-      inputRef.current?.focus();
+
+      const userMsg: ChatMessage = {
+        id: `user-${Date.now()}`,
+        connectionId: activeConnectionId,
+        sessionKey: activeSessionKey,
+        role: "user",
+        content: text,
+        contentType: "text",
+        timestamp: Date.now(),
+      };
+      addMessage(activeConnectionId, activeSessionKey, userMsg);
+
+      beginSessionRequest(activeConnectionId, activeSessionKey);
+      try {
+        await sendMessage(activeConnectionId, text, activeSessionKey);
+      } catch (e) {
+        console.error("send failed:", e);
+        markSessionFailed(activeConnectionId, activeSessionKey);
+      }
       return;
     }
-    setInput("");
 
-    const userMsg: ChatMessage = {
-      id: `user-${Date.now()}`,
+    // 有待发送附件：与输入框文字一并发出（不解析本地 / 指令）
+    const caption = text || undefined;
+    const fileLines = paths.map((p) => `📎 ${p.split(/[/\\]/).pop() || p}`);
+    const content =
+      caption && fileLines.length > 0
+        ? `${caption}\n\n${fileLines.join("\n")}`
+        : caption
+          ? caption
+          : fileLines.length === 1
+            ? fileLines[0]!
+            : fileLines.join("\n");
+    setInput("");
+    setPendingAttachmentPaths([]);
+    addMessage(activeConnectionId, activeSessionKey, {
+      id: `file-${Date.now()}`,
       connectionId: activeConnectionId,
       sessionKey: activeSessionKey,
       role: "user",
-      content: text,
-      contentType: "text",
+      content,
+      contentType: "file",
+      filePath: paths[0],
       timestamp: Date.now(),
-    };
-    addMessage(activeConnectionId, activeSessionKey, userMsg);
-
+    });
     beginSessionRequest(activeConnectionId, activeSessionKey);
     try {
-      await sendMessage(activeConnectionId, text, activeSessionKey);
+      await sendFiles(activeConnectionId, paths, caption, activeSessionKey);
     } catch (e) {
-      console.error("send failed:", e);
+      console.error("send file failed:", e);
       markSessionFailed(activeConnectionId, activeSessionKey);
     }
   }, [
     input,
+    pendingAttachmentPaths,
     activeConnectionId,
     activeSessionKey,
     addMessage,
@@ -1263,27 +1324,21 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
 
   const handleAttach = useCallback(async () => {
     if (!activeConnectionId || !activeSessionKey) return;
-    const selected = await open({ multiple: false });
-    if (selected) {
-      const path = String(selected);
-      addMessage(activeConnectionId, activeSessionKey, {
-        id: `file-${Date.now()}`,
-        connectionId: activeConnectionId,
-        sessionKey: activeSessionKey,
-        role: "user",
-        content: path.split(/[/\\]/).pop() || "file",
-        contentType: "file",
-        filePath: path,
-        timestamp: Date.now(),
-      });
-      try {
-        await sendFile(activeConnectionId, path, activeSessionKey);
-      } catch (e) {
-        console.error("send file failed:", e);
-        markSessionFailed(activeConnectionId, activeSessionKey);
-      }
-    }
-  }, [activeConnectionId, activeSessionKey, addMessage, markSessionFailed]);
+    const selected = await open({ multiple: true });
+    if (selected == null) return;
+    const paths = Array.isArray(selected) ? selected.map(String) : [String(selected)];
+    if (paths.length === 0) return;
+    setPendingAttachmentPaths((prev) => {
+      const next = new Set(prev);
+      for (const p of paths) next.add(p);
+      return Array.from(next);
+    });
+    inputRef.current?.focus();
+  }, [activeConnectionId, activeSessionKey]);
+
+  const removePendingAttachment = useCallback((path: string) => {
+    setPendingAttachmentPaths((prev) => prev.filter((p) => p !== path));
+  }, []);
 
   const handleButtonAction = useCallback(
     async (msg: ChatMessage, option: ChatButtonOption) => {
@@ -1455,6 +1510,10 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     setSlashIndex(0);
   }, [slashQuery]);
 
+  useEffect(() => {
+    setPendingAttachmentPaths([]);
+  }, [activeConnectionId, activeSessionKey]);
+
   return (
     <AnimatePresence>
       {chatOpen && (
@@ -1571,12 +1630,38 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               onSelect={handleSlashSelect}
               extraCommands={agentCommands}
             />
+            {pendingAttachmentPaths.length > 0 && (
+              <div className="mb-2 flex flex-wrap gap-1.5">
+                {pendingAttachmentPaths.map((p) => (
+                  <span
+                    key={p}
+                    className="inline-flex items-center gap-1 max-w-full rounded-lg border border-indigo-200 bg-indigo-50/80 pl-2.5 pr-1 py-1 text-[11px] text-indigo-800"
+                  >
+                    <span className="truncate" title={p}>
+                      📎 {p.split(/[/\\]/).pop() || p}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label="移除附件"
+                      className="shrink-0 rounded px-1 text-indigo-500 hover:bg-indigo-100 hover:text-indigo-800"
+                      onClick={() => removePendingAttachment(p)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
             <textarea
               ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+              placeholder={
+                pendingAttachmentPaths.length > 0
+                  ? "输入说明（可选），Enter 发送，Shift+Enter 换行"
+                  : "输入消息，Enter 发送，Shift+Enter 换行"
+              }
               className="w-full resize-none rounded-xl border border-gray-200 bg-gray-50 px-4 py-2.5 text-[13.5px] outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 transition-all placeholder:text-gray-400"
               rows={3}
             />
@@ -1600,7 +1685,11 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               )}
               <button
                 onClick={handleSend}
-                disabled={!input.trim() || !activeConnectionId || !activeSessionKey}
+                disabled={
+                  (!input.trim() && pendingAttachmentPaths.length === 0) ||
+                  !activeConnectionId ||
+                  !activeSessionKey
+                }
                 className="bg-indigo-500 hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg px-5 py-1.5 transition-colors"
               >
                 发送

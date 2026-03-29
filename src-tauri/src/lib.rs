@@ -41,6 +41,27 @@ fn default_session_key(bridge: &config::BridgeConfig) -> String {
     )
 }
 
+fn history_content_for_sent_files(caption: &Option<String>, paths: &[String]) -> String {
+    let file_lines: Vec<String> = paths
+        .iter()
+        .filter_map(|p| {
+            Path::new(p)
+                .file_name()
+                .map(|n| format!("📎 {}", n.to_string_lossy()))
+        })
+        .collect();
+    match (
+        caption.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()),
+        file_lines.len(),
+    ) {
+        (Some(c), 0) => c.to_string(),
+        (Some(c), _) => format!("{c}\n\n{}", file_lines.join("\n")),
+        (None, 0) => String::new(),
+        (None, 1) => file_lines.into_iter().next().unwrap_or_default(),
+        (None, _) => file_lines.join("\n"),
+    }
+}
+
 async fn resolve_session_key(
     state: &tauri::State<'_, Arc<AppState>>,
     connection_id: &str,
@@ -620,13 +641,17 @@ async fn send_message(
 }
 
 #[tauri::command]
-async fn send_file(
+async fn send_files(
     connection_id: String,
-    path: String,
+    paths: Vec<String>,
+    text: Option<String>,
     session_key: Option<String>,
     reply_ctx: Option<String>,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
+    if paths.is_empty() {
+        return Err("未选择文件".into());
+    }
     if let Some(target) = session_key.as_deref() {
         switch_remote_session_if_needed(&state, &connection_id, target).await?;
     }
@@ -634,14 +659,12 @@ async fn send_file(
     let client = match guard.get(&connection_id) {
         Some(c) => c,
         None => {
-            eprintln!("[bridge] send_file rejected: no active bridge client");
+            eprintln!("[bridge] send_files rejected: no active bridge client");
             return Err("Not connected".into());
         }
     };
-    let name = std::path::Path::new(&path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".into());
+    let caption = text.filter(|s| !s.trim().is_empty());
+    let hist_content = history_content_for_sent_files(&caption, &paths);
     let msg = ChatMessage {
         id: format!("file-{}", chrono::Utc::now().timestamp_millis()),
         connection_id: connection_id.clone(),
@@ -649,16 +672,37 @@ async fn send_file(
             .await
             .unwrap_or_default(),
         role: "user".into(),
-        content: name,
+        content: hist_content,
         content_type: "file".into(),
-        file_path: Some(path.clone()),
+        file_path: Some(paths[0].clone()),
         timestamp: chrono::Utc::now().timestamp_millis() as f64,
     };
     if let Err(e) = state.history.add(&msg).await {
         eprintln!("[bridge] history add failed for file, continue sending: {e}");
     }
     let ws_session_key = resolve_session_key(&state, &connection_id, session_key).await;
-    client.send_file(path, ws_session_key, reply_ctx).await
+    client
+        .send_files(paths, caption, ws_session_key, reply_ctx)
+        .await
+}
+
+#[tauri::command]
+async fn send_file(
+    connection_id: String,
+    path: String,
+    session_key: Option<String>,
+    reply_ctx: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    send_files(
+        connection_id,
+        vec![path],
+        None,
+        session_key,
+        reply_ctx,
+        state,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1223,6 +1267,7 @@ pub fn run() {
             send_message,
             send_card_action,
             send_file,
+            send_files,
             get_history,
             clear_history,
             set_always_on_top,

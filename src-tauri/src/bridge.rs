@@ -15,8 +15,9 @@ pub enum BridgeCommand {
         session_key: Option<String>,
         reply_ctx: Option<String>,
     },
-    SendFile {
-        path: String,
+    SendFiles {
+        paths: Vec<String>,
+        caption: Option<String>,
         session_key: Option<String>,
         reply_ctx: Option<String>,
     },
@@ -145,15 +146,17 @@ impl BridgeClient {
             .map_err(|e| e.to_string())
     }
 
-    pub async fn send_file(
+    pub async fn send_files(
         &self,
-        path: String,
+        paths: Vec<String>,
+        caption: Option<String>,
         session_key: Option<String>,
         reply_ctx: Option<String>,
     ) -> Result<(), String> {
         self.tx
-            .send(BridgeCommand::SendFile {
-                path,
+            .send(BridgeCommand::SendFiles {
+                paths,
+                caption,
                 session_key,
                 reply_ctx,
             })
@@ -358,6 +361,36 @@ fn default_reply_ctx(cfg: &BridgeConfig) -> String {
     format!("ctx-{}", cfg.user_id)
 }
 
+fn wire_content_for_file_bundle(caption: Option<&str>, names: &[String]) -> String {
+    if let Some(c) = caption.map(str::trim).filter(|s| !s.is_empty()) {
+        return c.to_string();
+    }
+    match names.len() {
+        0 => String::new(),
+        1 => format!("[文件: {}]", names[0]),
+        _ => format!("[文件: {}]", names.join(", ")),
+    }
+}
+
+fn guess_mime_type(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .as_deref()
+    {
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("txt") | Some("md") | Some("log") => "text/plain",
+        Some("json") => "application/json",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
 fn make_message(
     text: &str,
     cfg: &BridgeConfig,
@@ -384,19 +417,34 @@ fn make_message(
     .to_string()
 }
 
-fn make_file_message(
-    path: &str,
+fn make_files_message(
+    paths: &[String],
+    caption: Option<&str>,
     cfg: &BridgeConfig,
     session_key: Option<&str>,
     reply_ctx: Option<&str>,
 ) -> Result<String, String> {
-    let file_path = std::path::Path::new(path);
-    let data = std::fs::read(file_path).map_err(|e| e.to_string())?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-    let name = file_path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".into());
+    if paths.is_empty() {
+        return Err("no file paths".into());
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut file_objs: Vec<Value> = Vec::new();
+    for path in paths {
+        let file_path = std::path::Path::new(path);
+        let data = std::fs::read(file_path).map_err(|e| e.to_string())?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        let name = file_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".into());
+        names.push(name.clone());
+        let mime_type = guess_mime_type(file_path);
+        file_objs.push(json!({
+            "mime_type": mime_type,
+            "file_name": name,
+            "data": b64,
+        }));
+    }
     let session_key = session_key
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
@@ -405,15 +453,17 @@ fn make_file_message(
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| default_reply_ctx(cfg));
+    let wire_content = wire_content_for_file_bundle(caption, &names);
+    // cc-connect bridge expects `files` with file_name/mime_type/data (see bridge-protocol).
     Ok(json!({
         "type": "message",
         "msg_id": format!("pet-file-{}", uuid::Uuid::new_v4().to_string()[..8].to_string()),
         "session_key": session_key,
         "user_id": cfg.user_id,
         "user_name": "Desktop Pet",
-        "content": format!("[文件: {}]", name),
+        "content": wire_content,
         "reply_ctx": reply_ctx,
-        "attachments": [{"type": "file", "name": name, "data": b64}],
+        "files": file_objs,
     })
     .to_string())
 }
@@ -545,16 +595,22 @@ async fn bridge_loop(
                                         }
                                         eprintln!("[bridge:{client_id}] text frame sent");
                                     }
-                                    Some(BridgeCommand::SendFile { path, session_key, reply_ctx }) => {
-                                        match make_file_message(
-                                            &path,
+                                    Some(BridgeCommand::SendFiles { paths, caption, session_key, reply_ctx }) => {
+                                        match make_files_message(
+                                            &paths,
+                                            caption.as_deref(),
                                             &cfg2,
                                             session_key.as_deref(),
                                             reply_ctx.as_deref(),
                                         ) {
                                             Ok(msg) => {
+                                                eprintln!(
+                                                    "[bridge:{client_id}] sending files frame, paths={}, bytes={}",
+                                                    paths.len(),
+                                                    msg.len()
+                                                );
                                                 if write.send(Message::Text(msg.into())).await.is_err() {
-                                                    eprintln!("[bridge:{client_id}] send file failed; disconnected");
+                                                    eprintln!("[bridge:{client_id}] send files failed; disconnected");
                                                     return SendLoopExit::Disconnected;
                                                 }
                                             }
@@ -1156,6 +1212,49 @@ mod tests {
             Some("desktop-pet:user-a:room-42")
         );
         assert_eq!(v.get("reply_ctx").and_then(|x| x.as_str()), Some("ctx-room-42"));
+    }
+
+    #[test]
+    fn make_file_message_matches_cc_connect_files_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let raw = make_files_message(
+            &[path.to_str().unwrap().to_string()],
+            None,
+            &test_cfg(),
+            None,
+            None,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("message"));
+        assert!(v.get("attachments").is_none());
+        let files = v["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["file_name"], "note.txt");
+        assert_eq!(files[0]["mime_type"], "text/plain");
+        assert!(!files[0]["data"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn make_files_message_includes_caption_as_content_and_multiple_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.txt");
+        let p2 = dir.path().join("b.pdf");
+        std::fs::write(&p1, b"aa").unwrap();
+        std::fs::write(&p2, b"bb").unwrap();
+        let paths = vec![
+            p1.to_str().unwrap().to_string(),
+            p2.to_str().unwrap().to_string(),
+        ];
+        let raw = make_files_message(&paths, Some("请看附件"), &test_cfg(), None, None).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v.get("content").and_then(|x| x.as_str()), Some("请看附件"));
+        let files = v["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0]["file_name"], "a.txt");
+        assert_eq!(files[1]["file_name"], "b.pdf");
     }
 
     #[test]

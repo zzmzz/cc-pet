@@ -126,6 +126,23 @@ export async function sendFile(
   });
 }
 
+/** 发送多个文件；`text` 为附言，会与文件一起发给 cc-connect（一条 message）。 */
+export async function sendFiles(
+  connectionId: string,
+  paths: string[],
+  text?: string | null,
+  sessionKey?: string,
+  replyCtx?: string,
+): Promise<void> {
+  return invoke("send_files", {
+    connectionId,
+    paths,
+    text: text?.trim() ? text.trim() : null,
+    sessionKey: sessionKey ?? null,
+    replyCtx: replyCtx ?? null,
+  });
+}
+
 export async function getHistory(
   connectionId: string,
   limit: number,
