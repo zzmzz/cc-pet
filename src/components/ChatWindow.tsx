@@ -10,6 +10,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore, makeChatKey } from "@/lib/store";
 import {
   sendMessage,
+  downloadFileFromUrl,
   sendCardAction,
   sendFile,
   clearHistory,
@@ -45,6 +46,32 @@ const DEFAULT_TASK_STATE: SessionTaskState = {
   firstTokenAt: null,
   stalledReason: null,
 };
+
+type DownloadTaskStatus = "queued" | "downloading" | "completed" | "failed";
+
+interface DownloadTaskItem {
+  id: string;
+  url: string;
+  fileName: string;
+  status: DownloadTaskStatus;
+  receivedBytes: number;
+  totalBytes: number | null;
+  path: string | null;
+  error: string | null;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const fixed = unitIndex === 0 ? value.toFixed(0) : value.toFixed(1);
+  return `${fixed} ${units[unitIndex]}`;
+}
 
 function isNearBottom(el: HTMLDivElement, threshold = NEAR_BOTTOM_PX) {
   return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
@@ -153,7 +180,15 @@ async function loadLinkPreview(url: string): Promise<LinkPreviewData | null> {
   return task;
 }
 
-function LinkPreviewAnchor({ href, children }: { href?: string; children: ReactNode }) {
+function LinkPreviewAnchor({
+  href,
+  children,
+  onDownloadFile,
+}: {
+  href?: string;
+  children: ReactNode;
+  onDownloadFile?: (url: string, fileName: string) => void;
+}) {
   const normalizedHref = normalizeHref(href);
   const parsed = parseUrl(normalizedHref);
   if (!parsed || !normalizedHref) {
@@ -186,15 +221,23 @@ function LinkPreviewAnchor({ href, children }: { href?: string; children: ReactN
 
   if (fileLike || previewIndicatesFile) {
     const effectiveUrl = parseUrl(preview?.finalUrl) ?? parsed;
+    const downloadUrl = preview?.finalUrl || normalizedHref;
     const fileName = preview?.fileName?.trim() || getDisplayFileName(effectiveUrl);
     const host = effectiveUrl.hostname.replace(/^www\./, "");
     const fileTitle = preview?.title?.trim() || fileName || fallbackTitle;
     return (
-      <a href={preview?.finalUrl || normalizedHref} download={fileName || true} className="link-preview-card file-link-card">
+      <button
+        type="button"
+        className="link-preview-card file-link-card"
+        onClick={() => {
+          if (!onDownloadFile) return;
+          onDownloadFile(downloadUrl, fileName);
+        }}
+      >
         <span className="link-preview-badge">下载文件</span>
         <span className="link-preview-title">{fileTitle}</span>
         <span className="link-preview-meta">{fileName} · {host}</span>
-      </a>
+      </button>
     );
   }
 
@@ -309,10 +352,12 @@ function MessageBubble({
   msg,
   onButtonAction,
   onCustomButtonInput,
+  onDownloadFileLink,
 }: {
   msg: ChatMessage;
   onButtonAction: (msg: ChatMessage, option: ChatButtonOption) => void;
   onCustomButtonInput: (msg: ChatMessage, text: string) => void;
+  onDownloadFileLink: (url: string, fileName: string) => void;
 }) {
   const isUser = msg.role === "user";
 
@@ -444,12 +489,18 @@ function MessageBubble({
                 if (trailingNote) {
                   return (
                     <>
-                      <LinkPreviewAnchor href={trailingNote.url}>{trailingNote.url}</LinkPreviewAnchor>
+                      <LinkPreviewAnchor href={trailingNote.url} onDownloadFile={onDownloadFileLink}>
+                        {trailingNote.url}
+                      </LinkPreviewAnchor>
                       <span>{trailingNote.note}</span>
                     </>
                   );
                 }
-                return <LinkPreviewAnchor href={href}>{children}</LinkPreviewAnchor>;
+                return (
+                  <LinkPreviewAnchor href={href} onDownloadFile={onDownloadFileLink}>
+                    {children}
+                  </LinkPreviewAnchor>
+                );
               },
             }}
           >
@@ -510,6 +561,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
       : DEFAULT_TASK_STATE;
   const firstTokenTimeoutMs = Math.max(0, config?.pet.firstTokenTimeoutMs ?? 0);
   const streamIdleTimeoutMs = Math.max(0, config?.pet.streamIdleTimeoutMs ?? 0);
+  const canStop = activeTaskState.phase === "thinking" || activeTaskState.phase === "working";
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -517,6 +569,8 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const [slashIndex, setSlashIndex] = useState(0);
   const [updateChecking, setUpdateChecking] = useState(false);
   const [showJumpLatest, setShowJumpLatest] = useState(false);
+  const [downloadTasks, setDownloadTasks] = useState<Record<string, DownloadTaskItem>>({});
+  const downloadDismissTimersRef = useRef<Record<string, number>>({});
   const bridgeStreamBotIdRef = useRef<string | null>(null);
   const softCompleteTimersRef = useRef<Record<string, number>>({});
   const typingActiveRef = useRef<Record<string, boolean>>({});
@@ -583,6 +637,120 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   useEffect(() => {
     if (chatOpen) inputRef.current?.focus();
   }, [chatOpen]);
+
+  const clearDownloadDismissTimer = useCallback((id: string) => {
+    const timer = downloadDismissTimersRef.current[id];
+    if (!timer) return;
+    window.clearTimeout(timer);
+    delete downloadDismissTimersRef.current[id];
+  }, []);
+
+  const scheduleDownloadDismiss = useCallback(
+    (id: string) => {
+      clearDownloadDismissTimer(id);
+      downloadDismissTimersRef.current[id] = window.setTimeout(() => {
+        delete downloadDismissTimersRef.current[id];
+        setDownloadTasks((prev) => {
+          if (!prev[id] || prev[id].status !== "completed") return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+      }, 10_000);
+    },
+    [clearDownloadDismissTimer],
+  );
+
+  useEffect(() => {
+    return () => {
+      for (const timer of Object.values(downloadDismissTimersRef.current)) {
+        window.clearTimeout(timer);
+      }
+      downloadDismissTimersRef.current = {};
+    };
+  }, []);
+
+  useEffect(() => {
+    for (const [id, task] of Object.entries(downloadTasks)) {
+      if (task.status === "completed") {
+        if (!downloadDismissTimersRef.current[id]) {
+          scheduleDownloadDismiss(id);
+        }
+      } else {
+        clearDownloadDismissTimer(id);
+      }
+    }
+  }, [downloadTasks, scheduleDownloadDismiss, clearDownloadDismissTimer]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void listen<{
+      id: string;
+      url?: string;
+      status: "started" | "downloading" | "completed" | "failed";
+      fileName?: string;
+      path?: string;
+      receivedBytes?: number;
+      totalBytes?: number | null;
+      error?: string;
+    }>("file-download-progress", (event) => {
+      if (disposed) return;
+      const payload = event.payload;
+      if (!payload?.id) return;
+      if (payload.status === "completed") {
+        scheduleDownloadDismiss(payload.id);
+      } else {
+        clearDownloadDismissTimer(payload.id);
+      }
+      setDownloadTasks((prev) => {
+        const current = prev[payload.id] ?? {
+          id: payload.id,
+          url: payload.url ?? "",
+          fileName: payload.fileName ?? "下载文件",
+          status: "queued",
+          receivedBytes: 0,
+          totalBytes: null,
+          path: null,
+          error: null,
+        };
+        const nextStatus: DownloadTaskStatus =
+          payload.status === "started"
+            ? "queued"
+            : payload.status === "downloading"
+              ? "downloading"
+              : payload.status === "completed"
+                ? "completed"
+                : "failed";
+        return {
+          ...prev,
+          [payload.id]: {
+            ...current,
+            url: payload.url ?? current.url,
+            fileName: payload.fileName ?? current.fileName,
+            status: nextStatus,
+            receivedBytes: payload.receivedBytes ?? current.receivedBytes,
+            totalBytes: payload.totalBytes ?? current.totalBytes,
+            path:
+              nextStatus === "completed"
+                ? (payload.path ?? current.path)
+                : current.path,
+            error: payload.error ?? current.error,
+          },
+        };
+      });
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, [clearDownloadDismissTimer, scheduleDownloadDismiss]);
 
   const beginSessionRequest = useCallback(
     (connectionId: string, sessionKey: string) => {
@@ -1131,6 +1299,74 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     [activeConnectionId, activeSessionKey, markSessionFailed],
   );
 
+  const handleDownloadFileLink = useCallback(async (url: string, fileName: string) => {
+    const id = `dl-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    clearDownloadDismissTimer(id);
+    setDownloadTasks((prev) => ({
+      ...prev,
+      [id]: {
+        id,
+        url,
+        fileName: fileName || "下载文件",
+        status: "queued",
+        receivedBytes: 0,
+        totalBytes: null,
+        path: null,
+        error: null,
+      },
+    }));
+    try {
+      const path = await downloadFileFromUrl(url, fileName, id);
+      setDownloadTasks((prev) => {
+        const current = prev[id];
+        if (!current) return prev;
+        return {
+          ...prev,
+          [id]: {
+            ...current,
+            status: "completed",
+            path,
+          },
+        };
+      });
+      scheduleDownloadDismiss(id);
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      clearDownloadDismissTimer(id);
+      setDownloadTasks((prev) => {
+        const current = prev[id];
+        if (!current) return prev;
+        return {
+          ...prev,
+          [id]: {
+            ...current,
+            status: "failed",
+            error,
+          },
+        };
+      });
+    }
+  }, [clearDownloadDismissTimer, scheduleDownloadDismiss]);
+
+  const handleStop = useCallback(async () => {
+    if (!activeConnectionId || !activeSessionKey) return;
+    addMessage(activeConnectionId, activeSessionKey, {
+      id: `user-${Date.now()}`,
+      connectionId: activeConnectionId,
+      sessionKey: activeSessionKey,
+      role: "user",
+      content: "/stop",
+      contentType: "text",
+      timestamp: Date.now(),
+    });
+    try {
+      await sendMessage(activeConnectionId, "/stop", activeSessionKey);
+    } catch (e) {
+      console.error("send stop failed:", e);
+      markSessionFailed(activeConnectionId, activeSessionKey);
+    }
+  }, [activeConnectionId, activeSessionKey, addMessage, markSessionFailed]);
+
   const handleCustomButtonInput = useCallback(
     async (msg: ChatMessage, text: string) => {
       if (!activeConnectionId || !activeSessionKey) return;
@@ -1311,6 +1547,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
                   msg={msg}
                   onButtonAction={handleButtonAction}
                   onCustomButtonInput={handleCustomButtonInput}
+                  onDownloadFileLink={handleDownloadFileLink}
                 />
               ))}
             </div>
@@ -1351,6 +1588,16 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
                 📎 文件
               </button>
               <div className="flex-1" />
+              {canStop && (
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  disabled={!activeConnectionId || !activeSessionKey}
+                  className="mr-2 border border-red-200 bg-red-50 text-red-600 hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed text-sm font-semibold rounded-lg px-4 py-1.5 transition-colors"
+                >
+                  终止
+                </button>
+              )}
               <button
                 onClick={handleSend}
                 disabled={!input.trim() || !activeConnectionId || !activeSessionKey}
@@ -1359,6 +1606,63 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
                 发送
               </button>
             </div>
+            {Object.values(downloadTasks).length > 0 && (
+              <div className="mt-2 space-y-1">
+                {Object.values(downloadTasks)
+                  .slice(-3)
+                  .map((task) => {
+                    const percent =
+                      task.totalBytes && task.totalBytes > 0
+                        ? Math.min(100, Math.floor((task.receivedBytes / task.totalBytes) * 100))
+                        : null;
+                    const statusText =
+                      task.status === "completed"
+                        ? "已下载"
+                        : task.status === "failed"
+                          ? "下载失败"
+                          : percent !== null
+                            ? `下载中 ${percent}%`
+                            : `下载中 ${formatBytes(task.receivedBytes)}`;
+                    return (
+                      <div
+                        key={task.id}
+                        className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-xs"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium text-gray-700 truncate">{task.fileName}</span>
+                          <span
+                            className={`ml-auto ${
+                              task.status === "completed"
+                                ? "text-green-600"
+                                : task.status === "failed"
+                                  ? "text-red-600"
+                                  : "text-indigo-600"
+                            }`}
+                          >
+                            {statusText}
+                          </span>
+                        </div>
+                        {task.path && (
+                          <div className="mt-1 flex items-center gap-2">
+                            <span className="text-gray-500 break-all">{task.path}</span>
+                            <button
+                              type="button"
+                              className="ml-auto text-[11px] text-indigo-600 hover:text-indigo-700"
+                              onClick={() => revealFile(task.path!).catch(console.error)}
+                            >
+                              打开位置
+                            </button>
+                          </div>
+                        )}
+                        {!task.path && task.status !== "failed" && (
+                          <div className="mt-1 text-gray-500 break-all">{task.url}</div>
+                        )}
+                        {task.error && <div className="mt-1 text-red-600 break-all">{task.error}</div>}
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
           </div>
         </motion.div>
       )}

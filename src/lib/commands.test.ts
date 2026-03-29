@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import {
   clearHistory,
+  downloadFileFromUrl,
   fetchLinkPreview,
   getHistory,
   sendMessage,
@@ -56,6 +57,15 @@ describe("commands wrappers", () => {
     await fetchLinkPreview("https://ziiimo.cn/f/ce29");
     expect(invoke).toHaveBeenCalledWith("fetch_link_preview", {
       url: "https://ziiimo.cn/f/ce29",
+    });
+  });
+
+  it("maps downloadFileFromUrl to download_file_from_url invoke payload", async () => {
+    await downloadFileFromUrl("https://example.com/files/a.zip", "a.zip", "dl-1");
+    expect(invoke).toHaveBeenCalledWith("download_file_from_url", {
+      url: "https://example.com/files/a.zip",
+      suggestedFileName: "a.zip",
+      downloadId: "dl-1",
     });
   });
 

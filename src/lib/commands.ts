@@ -186,3 +186,15 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
 export async function fetchLinkPreview(url: string): Promise<LinkPreviewData> {
   return invoke("fetch_link_preview", { url });
 }
+
+export async function downloadFileFromUrl(
+  url: string,
+  suggestedFileName?: string,
+  downloadId?: string,
+): Promise<string> {
+  return invoke("download_file_from_url", {
+    url,
+    suggestedFileName: suggestedFileName ?? null,
+    downloadId: downloadId ?? null,
+  });
+}

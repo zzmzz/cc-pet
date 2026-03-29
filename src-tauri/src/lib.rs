@@ -7,10 +7,13 @@ mod tunnel;
 mod update;
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager, Size};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use bridge::BridgeClient;
@@ -754,8 +757,9 @@ async fn reveal_file(path: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
+        let parent = p.parent().ok_or_else(|| "Invalid file path".to_string())?;
         std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path))
+            .arg(parent)
             .spawn()
             .map_err(|e| e.to_string())?;
     }
@@ -806,6 +810,239 @@ async fn check_for_updates() -> Result<update::UpdateCheckResult, String> {
 #[tauri::command]
 async fn fetch_link_preview(url: String) -> Result<link_preview::LinkPreviewData, String> {
     link_preview::fetch(&url).await
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileDownloadProgressEvent {
+    id: String,
+    url: String,
+    status: String,
+    file_name: String,
+    path: Option<String>,
+    received_bytes: u64,
+    total_bytes: Option<u64>,
+    error: Option<String>,
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let mut cleaned = name
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            _ if ch.is_control() => '_',
+            _ => ch,
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+    if cleaned.is_empty() {
+        cleaned = "download".to_string();
+    }
+    cleaned
+}
+
+fn parse_content_disposition_filename(value: &str) -> Option<String> {
+    for part in value.split(';') {
+        let item = part.trim();
+        if let Some(raw) = item.strip_prefix("filename*=") {
+            let utf8_raw = raw.trim_start_matches("UTF-8''");
+            let decoded = urlencoding::decode(utf8_raw).ok()?.trim().to_string();
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    for part in value.split(';') {
+        let item = part.trim();
+        if let Some(raw) = item.strip_prefix("filename=") {
+            let name = raw.trim_matches('"').trim().to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_download_file_name(
+    url: &str,
+    suggested_file_name: Option<&str>,
+    content_disposition: Option<&str>,
+) -> String {
+    if let Some(name) = suggested_file_name {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return sanitize_file_name(trimmed);
+        }
+    }
+    if let Some(header) = content_disposition {
+        if let Some(name) = parse_content_disposition_filename(header) {
+            return sanitize_file_name(&name);
+        }
+    }
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        if let Some(last) = parsed
+            .path_segments()
+            .and_then(|mut segs| segs.next_back())
+            .filter(|s| !s.trim().is_empty())
+        {
+            return sanitize_file_name(last);
+        }
+    }
+    "download".to_string()
+}
+
+fn ensure_unique_download_path(base_dir: &Path, file_name: &str) -> PathBuf {
+    let mut candidate = base_dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "download".to_string());
+    let ext = Path::new(file_name)
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut index = 1u32;
+    loop {
+        let candidate_name = if ext.is_empty() {
+            format!("{stem} ({index})")
+        } else {
+            format!("{stem} ({index}).{ext}")
+        };
+        candidate = base_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+#[tauri::command]
+async fn download_file_from_url(
+    url: String,
+    suggested_file_name: Option<String>,
+    download_id: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let id = download_id.unwrap_or_else(|| {
+        format!(
+            "dl-{}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            uuid::Uuid::new_v4().simple()
+        )
+    });
+    let emit = |status: &str,
+                file_name: &str,
+                path: Option<String>,
+                received: u64,
+                total: Option<u64>,
+                error: Option<String>| {
+        let _ = app.emit(
+            "file-download-progress",
+            FileDownloadProgressEvent {
+                id: id.clone(),
+                url: url.clone(),
+                status: status.to_string(),
+                file_name: file_name.to_string(),
+                path,
+                received_bytes: received,
+                total_bytes: total,
+                error,
+            },
+        );
+    };
+
+    let client = reqwest::Client::new();
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            let msg = format!("下载请求失败: {err}");
+            emit("failed", "download", None, 0, None, Some(msg.clone()));
+            return Err(msg);
+        }
+    };
+    if !resp.status().is_success() {
+        let msg = format!("下载失败: HTTP {}", resp.status().as_u16());
+        emit("failed", "download", None, 0, None, Some(msg.clone()));
+        return Err(msg);
+    }
+
+    let total = resp.content_length();
+    let content_disposition = resp
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok());
+    let file_name = resolve_download_file_name(&url, suggested_file_name.as_deref(), content_disposition);
+    emit("started", &file_name, None, 0, total, None);
+
+    let download_dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "无法获取下载目录".to_string())?;
+    if let Err(err) = tokio::fs::create_dir_all(&download_dir).await {
+        let msg = format!("创建下载目录失败: {err}");
+        emit("failed", &file_name, None, 0, total, Some(msg.clone()));
+        return Err(msg);
+    }
+    let target_path = ensure_unique_download_path(&download_dir, &file_name);
+    let path_str = target_path.to_string_lossy().to_string();
+
+    let mut file = match tokio::fs::File::create(&target_path).await {
+        Ok(f) => f,
+        Err(err) => {
+            let msg = format!("创建文件失败: {err}");
+            emit("failed", &file_name, Some(path_str), 0, total, Some(msg.clone()));
+            return Err(msg);
+        }
+    };
+
+    let mut received = 0u64;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = match chunk_res {
+            Ok(c) => c,
+            Err(err) => {
+                let msg = format!("下载中断: {err}");
+                emit("failed", &file_name, Some(path_str.clone()), received, total, Some(msg.clone()));
+                return Err(msg);
+            }
+        };
+        if let Err(err) = file.write_all(&chunk).await {
+            let msg = format!("写入失败: {err}");
+            emit("failed", &file_name, Some(path_str.clone()), received, total, Some(msg.clone()));
+            return Err(msg);
+        }
+        received += chunk.len() as u64;
+        emit(
+            "downloading",
+            &file_name,
+            Some(path_str.clone()),
+            received,
+            total,
+            None,
+        );
+    }
+
+    if let Err(err) = file.flush().await {
+        let msg = format!("写入刷新失败: {err}");
+        emit("failed", &file_name, Some(path_str.clone()), received, total, Some(msg.clone()));
+        return Err(msg);
+    }
+
+    emit(
+        "completed",
+        &file_name,
+        Some(path_str.clone()),
+        received,
+        total,
+        None,
+    );
+    Ok(path_str)
 }
 
 #[tauri::command]
@@ -998,6 +1235,7 @@ pub fn run() {
             toggle_window_visibility,
             check_for_updates,
             fetch_link_preview,
+            download_file_from_url,
             list_bridge_sessions,
             list_local_sessions,
             update_session_label,

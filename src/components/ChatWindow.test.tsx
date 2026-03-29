@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatWindow } from "./ChatWindow";
 import { useAppStore, makeChatKey, defaultSessionKeyFromBridge } from "@/lib/store";
@@ -57,6 +57,7 @@ const TEST_SESSION_ID = defaultSessionKeyFromBridge({
 
 vi.mock("@/lib/commands", () => ({
   sendMessage: vi.fn(async () => {}),
+  downloadFileFromUrl: vi.fn(async () => "C:\\Users\\test\\Downloads\\app-v1.2.3.zip"),
   sendCardAction: vi.fn(async () => {}),
   sendFile: vi.fn(async () => {}),
   clearHistory: vi.fn(async () => {}),
@@ -170,6 +171,52 @@ describe("ChatWindow", () => {
     await waitFor(() => {
       expect(screen.getByText("处理中")).toBeInTheDocument();
     });
+  });
+
+  it("shows stop button while working and sends /stop command", async () => {
+    const user = userEvent.setup();
+    useAppStore.getState().setSessionTaskState(testBridge.id, SESSION, {
+      activeRequestId: "req-working-stop",
+      phase: "working",
+      startedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      firstTokenAt: Date.now(),
+      stalledReason: null,
+    });
+    render(<ChatWindow />);
+
+    const stopButton = screen.getByRole("button", { name: "终止" });
+    expect(stopButton).toBeInTheDocument();
+    await user.click(stopButton);
+
+    expect(commands.sendMessage).toHaveBeenCalledWith(
+      testBridge.id,
+      "/stop",
+      SESSION,
+    );
+  });
+
+  it("shows stop button while thinking and sends /stop command", async () => {
+    const user = userEvent.setup();
+    useAppStore.getState().setSessionTaskState(testBridge.id, SESSION, {
+      activeRequestId: "req-thinking-stop",
+      phase: "thinking",
+      startedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      firstTokenAt: null,
+      stalledReason: null,
+    });
+    render(<ChatWindow />);
+
+    const stopButton = screen.getByRole("button", { name: "终止" });
+    expect(stopButton).toBeInTheDocument();
+    await user.click(stopButton);
+
+    expect(commands.sendMessage).toHaveBeenCalledWith(
+      testBridge.id,
+      "/stop",
+      SESSION,
+    );
   });
 
   it("uses typing events to drive working and completed status", async () => {
@@ -488,11 +535,106 @@ describe("ChatWindow", () => {
 
     render(<ChatWindow />);
 
-    const fileLink = screen.getByRole("link", { name: /app-v1\.2\.3\.zip/i });
+    const fileLink = screen.getByRole("button", { name: /app-v1\.2\.3\.zip/i });
     expect(fileLink).toHaveClass("link-preview-card", "file-link-card");
-    expect(fileLink).toHaveAttribute("download");
     expect(screen.getByText("下载文件")).toBeInTheDocument();
     expect(fileLink.textContent).toContain("app-v1.2.3.zip");
+  });
+
+  it("shows saved path when download completed event arrives", async () => {
+    render(<ChatWindow />);
+    await waitFor(() => {
+      expect((eventHandlers.get("file-download-progress")?.size ?? 0) > 0).toBe(true);
+    });
+
+    emitMockEvent("file-download-progress", {
+      id: "dl-event-complete",
+      status: "completed",
+      url: "https://example.com/files/app-v1.2.3.zip",
+      fileName: "app-v1.2.3.zip",
+      path: "C:\\Users\\test\\Downloads\\app-v1.2.3.zip",
+      receivedBytes: 1024,
+      totalBytes: 1024,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("app-v1.2.3.zip")).toBeInTheDocument();
+      expect(screen.getByText(/C:\\Users\\test\\Downloads\\app-v1.2.3.zip/)).toBeInTheDocument();
+      expect(screen.getByText("已下载")).toBeInTheDocument();
+    });
+  });
+
+  it("opens exact displayed downloaded path", async () => {
+    const user = userEvent.setup();
+    render(<ChatWindow />);
+    await waitFor(() => {
+      expect((eventHandlers.get("file-download-progress")?.size ?? 0) > 0).toBe(true);
+    });
+
+    const completedPath = "C:\\Users\\test\\Downloads\\report-2026-03.pdf";
+    emitMockEvent("file-download-progress", {
+      id: "dl-open-path-1",
+      status: "completed",
+      url: "https://example.com/files/report-2026-03.pdf",
+      fileName: "report-2026-03.pdf",
+      path: completedPath,
+      receivedBytes: 2048,
+      totalBytes: 2048,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(completedPath)).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole("button", { name: "打开位置" }));
+    expect(commands.revealFile).toHaveBeenCalledWith(completedPath);
+  });
+
+  it("auto hides completed download tip after 10 seconds", async () => {
+    render(<ChatWindow />);
+    await waitFor(() => {
+      expect((eventHandlers.get("file-download-progress")?.size ?? 0) > 0).toBe(true);
+    });
+    vi.useFakeTimers();
+
+    const completedPath = "C:\\Users\\test\\Downloads\\demo.zip";
+    act(() => {
+      emitMockEvent("file-download-progress", {
+        id: "dl-auto-hide-1",
+        status: "completed",
+        url: "https://example.com/files/demo.zip",
+        fileName: "demo.zip",
+        path: completedPath,
+        receivedBytes: 1024,
+        totalBytes: 1024,
+      });
+    });
+
+    expect(screen.getByText(completedPath)).toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_100);
+    });
+    expect(screen.queryByText(completedPath)).not.toBeInTheDocument();
+  });
+
+  it("updates file download progress by backend events", async () => {
+    render(<ChatWindow />);
+    await waitFor(() => {
+      expect((eventHandlers.get("file-download-progress")?.size ?? 0) > 0).toBe(true);
+    });
+
+    emitMockEvent("file-download-progress", {
+      id: "dl-event-1",
+      status: "downloading",
+      url: "https://example.com/files/demo.zip",
+      fileName: "demo.zip",
+      receivedBytes: 512,
+      totalBytes: 1024,
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/下载中 50%/)).toBeInTheDocument();
+      expect(screen.getByText("demo.zip")).toBeInTheDocument();
+    });
   });
 
   it("formats bare url into readable card title without preview label", async () => {
@@ -559,9 +701,8 @@ describe("ChatWindow", () => {
 
     render(<ChatWindow />);
 
-    const link = await screen.findByRole("link", { name: /report-2026-03\.pdf/i });
+    const link = await screen.findByRole("button", { name: /report-2026-03\.pdf/i });
     expect(link).toHaveClass("file-link-card");
-    expect(link).toHaveAttribute("download");
   });
 
   it("trims trailing spaces encoded as %20 in bare links", async () => {
