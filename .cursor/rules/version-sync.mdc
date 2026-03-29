@@ -16,8 +16,28 @@ alwaysApply: true
 ```
 1. 更新三个文件的版本号（不带 v 前缀）
 2. git add + git commit -m "chore: bump version to x.y.z"
-3. git tag -a vx.y.z -m "版本说明"
+3. git tag -a vx.y.z -m "<清晰的版本发布说明>"
 4. git push origin main; git push origin vx.y.z
+```
+
+## Tag 说明要求（必须）
+
+打 tag 时，`-m` 的内容不能只写“版本说明”或空泛文字，必须写清楚本次更新内容，至少包含：
+
+1. 主要变更（新增/修复/优化）
+2. 影响范围（模块或功能）
+3. 兼容性或注意事项（如有）
+
+推荐格式：
+
+```bash
+git tag -a vx.y.z -m "vX.Y.Z
+
+- feat: ...
+- fix: ...
+- perf/refactor: ...
+- note: ...
+"
 ```
 
 **禁止先打 tag 再改版本号**——tag 必须指向已包含正确版本号的提交。

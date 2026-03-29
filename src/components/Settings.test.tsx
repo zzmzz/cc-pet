@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Settings } from "./Settings";
 import { useAppStore } from "@/lib/store";
@@ -27,8 +27,11 @@ vi.mock("@/lib/manualUpdateCheck", () => ({
 vi.mock("@/lib/commands", () => ({
   connectBridge: vi.fn(async () => {}),
   disconnectBridge: vi.fn(async () => {}),
+  getSshTunnelStatus: vi.fn(async () => []),
   saveConfig: vi.fn(async () => {}),
   setAlwaysOnTop: vi.fn(async () => {}),
+  startSshTunnel: vi.fn(async () => {}),
+  stopSshTunnel: vi.fn(async () => {}),
   setWindowOpacity: vi.fn(async () => {}),
 }));
 
@@ -50,6 +53,7 @@ const baseConfig: AppConfig = {
     chatWindowOpacity: 0.95,
     chatWindowWidth: 480,
     chatWindowHeight: 640,
+    toggleVisibilityShortcut: "Ctrl+Shift+H",
     appearance: {},
   },
   llm: {
@@ -84,7 +88,7 @@ describe("Settings", () => {
     const tokenInput = screen.getByDisplayValue("token");
     await user.clear(tokenInput);
     await user.type(tokenInput, "new-token");
-    await user.click(screen.getByRole("button", { name: "保存" }));
+    await user.click(screen.getAllByRole("button", { name: "保存" })[0]);
 
     expect(commands.saveConfig).toHaveBeenCalledTimes(1);
     const saved = vi.mocked(commands.saveConfig).mock.calls[0][0] as AppConfig;
@@ -118,5 +122,28 @@ describe("Settings", () => {
         value: originalRandomUUID,
       });
     }
+  });
+
+  it("saves visibility shortcut from pet settings tab", async () => {
+    const user = userEvent.setup();
+    render(<Settings />);
+
+    await user.click(screen.getAllByRole("button", { name: "宠物" })[0]);
+    const shortcutInput = screen.getByDisplayValue("Ctrl+Shift+H");
+    fireEvent.change(shortcutInput, { target: { value: "Ctrl+Alt+P" } });
+    await user.click(screen.getAllByRole("button", { name: "保存" })[0]);
+
+    const saved = vi.mocked(commands.saveConfig).mock.calls[0][0] as AppConfig;
+    expect(saved.pet.toggleVisibilityShortcut).toBe("Ctrl+Alt+P");
+  });
+
+  it("does not render edge auto-hide controls", async () => {
+    const user = userEvent.setup();
+    render(<Settings />);
+    await user.click(screen.getAllByRole("button", { name: "宠物" })[0]);
+
+    expect(screen.queryByText("贴边自动隐藏")).toBeNull();
+    expect(screen.queryByText("触发距离")).toBeNull();
+    expect(screen.queryByText("贴边保留")).toBeNull();
   });
 });

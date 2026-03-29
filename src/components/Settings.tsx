@@ -4,11 +4,14 @@ import { useAppStore } from "@/lib/store";
 import {
   connectBridge,
   disconnectBridge,
+  getSshTunnelStatus,
   saveConfig,
+  startSshTunnel,
+  stopSshTunnel,
   setAlwaysOnTop,
   setWindowOpacity,
 } from "@/lib/commands";
-import type { AppConfig, BridgeConfig, PetAppearance } from "@/lib/types";
+import type { AppConfig, BridgeConfig, PetAppearance, SshTunnelConfig } from "@/lib/types";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -35,6 +38,22 @@ function createBridge(): BridgeConfig {
     token: "",
     platformName: "desktop-pet",
     userId: "pet-user",
+    sshTunnel: defaultSshTunnel(),
+  };
+}
+
+function defaultSshTunnel(): SshTunnelConfig {
+  return {
+    enabled: false,
+    bastionHost: "",
+    bastionPort: 22,
+    bastionUser: "",
+    targetHost: "192.168.8.2",
+    targetPort: 9810,
+    localHost: "127.0.0.1",
+    localPort: 9810,
+    identityFile: "",
+    strictHostKeyChecking: true,
   };
 }
 
@@ -52,6 +71,9 @@ export function Settings() {
   const [tab, setTab] = useState<"bridge" | "pet">("bridge");
   const [appVersion, setAppVersion] = useState("");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [tunnelStatus, setTunnelStatus] = useState<Record<string, boolean>>({});
+  const [tunnelBusy, setTunnelBusy] = useState<Record<string, boolean>>({});
+  const [tunnelError, setTunnelError] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (config && settingsOpen) {
@@ -65,6 +87,17 @@ export function Settings() {
     getVersion()
       .then(setAppVersion)
       .catch(() => setAppVersion("—"));
+  }, [settingsOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    void getSshTunnelStatus()
+      .then((items) => {
+        const next: Record<string, boolean> = {};
+        for (const item of items) next[item.id] = item.running;
+        setTunnelStatus(next);
+      })
+      .catch(() => undefined);
   }, [settingsOpen]);
 
   if (!form) return null;
@@ -121,7 +154,7 @@ export function Settings() {
   const updateBridge = (
     index: number,
     field: keyof BridgeConfig,
-    value: string | number
+    value: string | number | SshTunnelConfig
   ) => {
     setForm((prev) => {
       if (!prev) return prev;
@@ -131,6 +164,47 @@ export function Settings() {
       bridges[index][field] = value as never;
       return next;
     });
+  };
+
+  const updateTunnel = (
+    index: number,
+    field: keyof SshTunnelConfig,
+    value: string | number | boolean
+  ) => {
+    setForm((prev) => {
+      if (!prev) return prev;
+      const next = JSON.parse(JSON.stringify(prev)) as AppConfig;
+      const bridges = Array.isArray(next.bridges) ? next.bridges : [];
+      const bridge = bridges[index];
+      if (!bridge) return next;
+      const tunnel = bridge.sshTunnel ?? defaultSshTunnel();
+      bridge.sshTunnel = {
+        ...tunnel,
+        [field]: value as never,
+      };
+      return next;
+    });
+  };
+
+  const toggleTunnel = async (bridgeId: string, running: boolean) => {
+    setTunnelBusy((prev) => ({ ...prev, [bridgeId]: true }));
+    setTunnelError((prev) => ({ ...prev, [bridgeId]: "" }));
+    try {
+      if (running) {
+        await stopSshTunnel(bridgeId);
+        setTunnelStatus((prev) => ({ ...prev, [bridgeId]: false }));
+      } else {
+        const bridge = (form?.bridges ?? []).find((b) => b.id === bridgeId);
+        await startSshTunnel(bridgeId, bridge?.sshTunnel ?? defaultSshTunnel());
+        setTunnelStatus((prev) => ({ ...prev, [bridgeId]: true }));
+      }
+    } catch (e) {
+      console.error("toggle ssh tunnel failed:", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      setTunnelError((prev) => ({ ...prev, [bridgeId]: msg || "启动隧道失败" }));
+    } finally {
+      setTunnelBusy((prev) => ({ ...prev, [bridgeId]: false }));
+    }
   };
 
   const addBridge = () => {
@@ -303,6 +377,149 @@ export function Settings() {
                         value={bridge.userId}
                         onChange={(v) => updateBridge(index, "userId", v)}
                       />
+                      <div className="rounded-lg border border-gray-100 p-2 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-semibold text-gray-600">
+                            SSH 跳板映射
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateTunnel(
+                                index,
+                                "enabled",
+                                !(bridge.sshTunnel ?? defaultSshTunnel()).enabled
+                              )
+                            }
+                            className={`relative w-10 h-5 rounded-full transition-colors ${
+                              (bridge.sshTunnel ?? defaultSshTunnel()).enabled
+                                ? "bg-indigo-500"
+                                : "bg-gray-300"
+                            }`}
+                          >
+                            <span
+                              className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+                                (bridge.sshTunnel ?? defaultSshTunnel()).enabled
+                                  ? "translate-x-5"
+                                  : ""
+                              }`}
+                            />
+                          </button>
+                        </div>
+                        {(bridge.sshTunnel ?? defaultSshTunnel()).enabled && (
+                          <div className="space-y-2">
+                            <Field
+                              label="Bastion Host"
+                              value={(bridge.sshTunnel ?? defaultSshTunnel()).bastionHost}
+                              onChange={(v) => updateTunnel(index, "bastionHost", v)}
+                            />
+                            <Field
+                              label="Bastion Port"
+                              value={String((bridge.sshTunnel ?? defaultSshTunnel()).bastionPort)}
+                              onChange={(v) =>
+                                updateTunnel(index, "bastionPort", parseInt(v) || 22)
+                              }
+                              type="number"
+                            />
+                            <Field
+                              label="Bastion User"
+                              value={(bridge.sshTunnel ?? defaultSshTunnel()).bastionUser}
+                              onChange={(v) => updateTunnel(index, "bastionUser", v)}
+                            />
+                            <Field
+                              label="Target Host"
+                              value={(bridge.sshTunnel ?? defaultSshTunnel()).targetHost}
+                              onChange={(v) => updateTunnel(index, "targetHost", v)}
+                            />
+                            <Field
+                              label="Target Port"
+                              value={String((bridge.sshTunnel ?? defaultSshTunnel()).targetPort)}
+                              onChange={(v) =>
+                                updateTunnel(index, "targetPort", parseInt(v) || 9810)
+                              }
+                              type="number"
+                            />
+                            <Field
+                              label="Local Host"
+                              value={(bridge.sshTunnel ?? defaultSshTunnel()).localHost}
+                              onChange={(v) => updateTunnel(index, "localHost", v)}
+                            />
+                            <Field
+                              label="Local Port"
+                              value={String((bridge.sshTunnel ?? defaultSshTunnel()).localPort)}
+                              onChange={(v) =>
+                                updateTunnel(index, "localPort", parseInt(v) || 9810)
+                              }
+                              type="number"
+                            />
+                            <Field
+                              label="Identity File"
+                              value={(bridge.sshTunnel ?? defaultSshTunnel()).identityFile}
+                              onChange={(v) => updateTunnel(index, "identityFile", v)}
+                              placeholder="C:\\Users\\xxx\\.ssh\\id_ed25519"
+                            />
+                            <p className="text-[11px] text-gray-400 pl-[7rem]">
+                              留空将使用系统默认 SSH 私钥（~/.ssh/id_ed25519 等）
+                            </p>
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs text-gray-600">严格校验主机指纹</span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  updateTunnel(
+                                    index,
+                                    "strictHostKeyChecking",
+                                    !(bridge.sshTunnel ?? defaultSshTunnel())
+                                      .strictHostKeyChecking
+                                  )
+                                }
+                                className={`relative w-10 h-5 rounded-full transition-colors ${
+                                  (bridge.sshTunnel ?? defaultSshTunnel())
+                                    .strictHostKeyChecking
+                                    ? "bg-indigo-500"
+                                    : "bg-gray-300"
+                                }`}
+                              >
+                                <span
+                                  className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow transition-transform ${
+                                    (bridge.sshTunnel ?? defaultSshTunnel())
+                                      .strictHostKeyChecking
+                                      ? "translate-x-5"
+                                      : ""
+                                  }`}
+                                />
+                              </button>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  void toggleTunnel(
+                                    bridge.id,
+                                    Boolean(tunnelStatus[bridge.id])
+                                  )
+                                }
+                                disabled={Boolean(tunnelBusy[bridge.id])}
+                                className="text-xs px-3 py-1.5 rounded bg-gray-100 hover:bg-gray-200 text-gray-700 disabled:opacity-50"
+                              >
+                                {tunnelBusy[bridge.id]
+                                  ? "处理中..."
+                                  : tunnelStatus[bridge.id]
+                                    ? "停止隧道"
+                                    : "启动隧道"}
+                              </button>
+                              <span className="text-[11px] text-gray-500">
+                                状态：{tunnelStatus[bridge.id] ? "运行中" : "未运行"}
+                              </span>
+                            </div>
+                            {tunnelError[bridge.id] ? (
+                              <p className="text-[11px] text-red-500">
+                                错误：{tunnelError[bridge.id]}
+                              </p>
+                            ) : null}
+                          </div>
+                        )}
+                      </div>
                     </div>
                   ))}
                   <button
@@ -354,6 +571,31 @@ export function Settings() {
                       />
                     </button>
                   </div>
+
+                  <Field
+                    label="隐藏/显示快捷键"
+                    value={form.pet.toggleVisibilityShortcut || "Ctrl+Shift+H"}
+                    onChange={(v) => update("pet.toggleVisibilityShortcut", v)}
+                    placeholder="例如 Ctrl+Shift+H"
+                  />
+
+                  <Field
+                    label="首包超时(ms)"
+                    value={String(form.pet.firstTokenTimeoutMs ?? 0)}
+                    onChange={(v) => update("pet.firstTokenTimeoutMs", Math.max(0, parseInt(v) || 0))}
+                    type="number"
+                  />
+
+                  <Field
+                    label="流式静默超时(ms)"
+                    value={String(form.pet.streamIdleTimeoutMs ?? 0)}
+                    onChange={(v) => update("pet.streamIdleTimeoutMs", Math.max(0, parseInt(v) || 0))}
+                    type="number"
+                  />
+
+                  <p className="text-[11px] text-gray-400 pl-[7rem]">
+                    默认 0 表示不设超时
+                  </p>
 
                   <div>
                     <div className="flex items-center justify-between mb-1">

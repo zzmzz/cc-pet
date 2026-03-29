@@ -1,5 +1,32 @@
 export type PetState = "idle" | "thinking" | "talking" | "happy" | "error";
 
+export type SessionTaskPhase =
+  | "idle"
+  | "thinking"
+  | "working"
+  | "awaiting_confirmation"
+  | "completed"
+  | "failed"
+  | "stalled";
+
+export type SessionTaskStalledReason =
+  | "first_token_timeout"
+  | "stream_idle_timeout";
+
+export interface SessionTaskState {
+  activeRequestId: string | null;
+  phase: SessionTaskPhase;
+  startedAt: number | null;
+  lastActivityAt: number | null;
+  firstTokenAt: number | null;
+  stalledReason: SessionTaskStalledReason | null;
+}
+
+export interface ChatButtonOption {
+  text: string;
+  data: string;
+}
+
 export interface ChatMessage {
   id: string;
   connectionId: string;
@@ -7,7 +34,8 @@ export interface ChatMessage {
   replyCtx?: string;
   role: "user" | "bot";
   content: string;
-  contentType: "text" | "file" | "image";
+  contentType: "text" | "file" | "image" | "buttons";
+  buttons?: ChatButtonOption[][];
   filePath?: string;
   timestamp: number;
 }
@@ -28,6 +56,25 @@ export interface BridgeConfig {
   token: string;
   platformName: string;
   userId: string;
+  sshTunnel?: SshTunnelConfig;
+}
+
+export interface SshTunnelConfig {
+  enabled: boolean;
+  bastionHost: string;
+  bastionPort: number;
+  bastionUser: string;
+  targetHost: string;
+  targetPort: number;
+  localHost: string;
+  localPort: number;
+  identityFile: string;
+  strictHostKeyChecking: boolean;
+}
+
+export interface SshTunnelStatus {
+  id: string;
+  running: boolean;
 }
 
 
@@ -45,6 +92,9 @@ export interface PetConfig {
   chatWindowOpacity: number;
   chatWindowWidth: number;
   chatWindowHeight: number;
+  toggleVisibilityShortcut: string;
+  firstTokenTimeoutMs?: number;
+  streamIdleTimeoutMs?: number;
   appearance?: PetAppearance;
 }
 
@@ -109,3 +159,4 @@ export interface LinkPreviewData {
   isFile?: boolean;
   fileName?: string;
 }
+

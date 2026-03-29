@@ -3,7 +3,7 @@ import { useEffect, useCallback, useMemo, useRef } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "@/lib/store";
-import { quitApp } from "@/lib/commands";
+import { quitApp, togglePetVisibility } from "@/lib/commands";
 import type { PetAppearance, PetState } from "@/lib/types";
 
 import petIdle from "@/assets/pet/idle.png";
@@ -322,13 +322,20 @@ function PetContextMenu({
       },
     },
     {
+      label: "🙈 隐藏 / 显示",
+      action: () => {
+        togglePetVisibility().catch(console.error);
+        onClose();
+      },
+    },
+    { divider: true as const },
+    {
       label: "⚙️ 设置",
       action: () => {
         setSettingsOpen(true);
         onClose();
       },
     },
-    { divider: true as const },
     {
       label: "🚪 退出",
       action: () => {

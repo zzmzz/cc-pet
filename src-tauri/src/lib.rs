@@ -3,12 +3,14 @@ mod config;
 pub mod history;
 mod link_preview;
 mod llm;
+mod tunnel;
 mod update;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager, Size};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tokio::sync::Mutex;
 
 use bridge::BridgeClient;
@@ -18,11 +20,16 @@ use llm::LlmMessage;
 
 struct AppState {
     bridges: Mutex<HashMap<String, BridgeClient>>,
+    tunnels: Mutex<HashMap<String, tunnel::SshTunnelProcess>>,
     bridge_connect_lock: Mutex<()>,
     history: ChatHistory,
     config: Mutex<AppConfig>,
     tray: StdMutex<Option<tauri::tray::TrayIcon>>,
+    visibility_shortcut: StdMutex<Option<String>>,
+    shutdown_started: StdMutex<bool>,
 }
+
+const DEFAULT_TOGGLE_SHORTCUT: &str = "Ctrl+Shift+H";
 
 fn default_session_key(bridge: &config::BridgeConfig) -> String {
     format!(
@@ -54,6 +61,13 @@ struct BridgeStatus {
     id: String,
     name: String,
     connected: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshTunnelStatus {
+    id: String,
+    running: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,10 +361,144 @@ async fn load_config() -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
-async fn save_config(config: AppConfig, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+async fn save_config(
+    mut config: AppConfig,
+    state: tauri::State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let shortcut = apply_toggle_shortcut(&app, state.inner(), &config.pet.toggle_visibility_shortcut)?;
+    config.pet.toggle_visibility_shortcut = shortcut;
     config::save_config(&config)?;
     *state.config.lock().await = config;
     Ok(())
+}
+
+fn validate_ssh_tunnel(cfg: &config::SshTunnelConfig) -> Result<(), String> {
+    if cfg.bastion_host.trim().is_empty() {
+        return Err("SSH bastion host is required".into());
+    }
+    if cfg.bastion_user.trim().is_empty() {
+        return Err("SSH bastion user is required".into());
+    }
+    if cfg.target_host.trim().is_empty() {
+        return Err("SSH target host is required".into());
+    }
+    if cfg.local_host.trim().is_empty() {
+        return Err("SSH local host is required".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_ssh_tunnel(
+    connection_id: String,
+    tunnel_config: Option<config::SshTunnelConfig>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let tunnel_cfg = if let Some(cfg) = tunnel_config {
+        cfg
+    } else {
+        let cfg = state.config.lock().await.clone();
+        let bridge_cfg = cfg
+            .bridges
+            .iter()
+            .find(|b| b.id == connection_id)
+            .cloned()
+            .ok_or_else(|| format!("Bridge not found: {connection_id}"))?;
+        bridge_cfg
+            .ssh_tunnel
+            .ok_or_else(|| "SSH tunnel config not found".to_string())?
+    };
+    if !tunnel_cfg.enabled {
+        return Err("SSH tunnel is disabled in config".into());
+    }
+    validate_ssh_tunnel(&tunnel_cfg)?;
+
+    let mut guard = state.tunnels.lock().await;
+    if let Some(existing) = guard.get_mut(&connection_id) {
+        if let Ok(None) = existing.child.try_wait() {
+            return Ok(());
+        }
+    }
+
+    let mut proc = tunnel::spawn_ssh_tunnel(&tunnel_cfg)?;
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if let Ok(Some(status)) = proc.child.try_wait() {
+        let stderr = tunnel::read_process_stderr(&mut proc.child);
+        if stderr.is_empty() {
+            return Err(format!("ssh exited early: {status}"));
+        }
+        return Err(format!("ssh exited early: {status}; {stderr}"));
+    }
+    guard.insert(connection_id, proc);
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_ssh_tunnel(
+    connection_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let mut guard = state.tunnels.lock().await;
+    if let Some(mut proc) = guard.remove(&connection_id) {
+        let _ = proc.child.kill();
+        let _ = proc.child.wait();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_ssh_tunnel_status(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<SshTunnelStatus>, String> {
+    let cfg = state.config.lock().await.clone();
+    let mut guard = state.tunnels.lock().await;
+    let mut statuses = Vec::new();
+
+    for bridge in cfg.bridges {
+        let running = if let Some(proc) = guard.get_mut(&bridge.id) {
+            matches!(proc.child.try_wait(), Ok(None))
+        } else {
+            false
+        };
+        statuses.push(SshTunnelStatus {
+            id: bridge.id,
+            running,
+        });
+    }
+    Ok(statuses)
+}
+
+fn mark_shutdown_started(state: &Arc<AppState>) -> bool {
+    match state.shutdown_started.lock() {
+        Ok(mut started) => {
+            if *started {
+                false
+            } else {
+                *started = true;
+                true
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+async fn shutdown_network_resources(state: &Arc<AppState>) {
+    if !mark_shutdown_started(state) {
+        return;
+    }
+
+    let clients: Vec<BridgeClient> = {
+        let mut guard = state.bridges.lock().await;
+        guard.drain().map(|(_, client)| client).collect()
+    };
+    for client in clients {
+        client.stop().await;
+    }
+
+    let mut tunnels = state.tunnels.lock().await;
+    for (_, mut proc) in tunnels.drain() {
+        let _ = proc.child.kill();
+        let _ = proc.child.wait();
+    }
 }
 
 #[tauri::command]
@@ -511,6 +659,26 @@ async fn send_file(
 }
 
 #[tauri::command]
+async fn send_card_action(
+    connection_id: String,
+    action: String,
+    session_key: Option<String>,
+    reply_ctx: Option<String>,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    if let Some(target) = session_key.as_deref() {
+        switch_remote_session_if_needed(&state, &connection_id, target).await?;
+    }
+    let guard = state.bridges.lock().await;
+    let client = match guard.get(&connection_id) {
+        Some(c) => c,
+        None => return Err("Not connected".into()),
+    };
+    let ws_session_key = resolve_session_key(&state, &connection_id, session_key).await;
+    client.send_card_action(action, ws_session_key, reply_ctx).await
+}
+
+#[tauri::command]
 async fn get_history(
     connection_id: String,
     session_key: Option<String>,
@@ -616,8 +784,18 @@ async fn reveal_file(path: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<Arc<AppState>>();
+    shutdown_network_resources(state.inner()).await;
     app.exit(0);
     Ok(())
+}
+
+#[tauri::command]
+async fn toggle_window_visibility(
+    state: tauri::State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    toggle_main_window_visibility(&app, &state)
 }
 
 #[tauri::command]
@@ -656,6 +834,56 @@ async fn set_main_window_size(width: f64, height: f64, app: tauri::AppHandle) ->
     Ok(())
 }
 
+fn reveal_main_window_if_hidden(_app: &tauri::AppHandle, _state: &Arc<AppState>) -> Result<(), String> {
+    Ok(())
+}
+
+fn toggle_main_window_visibility(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+    let Some(win) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    if win.is_visible().map_err(|e| e.to_string())? {
+        win.hide().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    reveal_main_window_if_hidden(app, state)?;
+    win.show().map_err(|e| e.to_string())?;
+    win.set_focus().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn normalize_toggle_shortcut(shortcut: &str) -> String {
+    let trimmed = shortcut.trim();
+    if trimmed.is_empty() {
+        DEFAULT_TOGGLE_SHORTCUT.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn apply_toggle_shortcut(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    shortcut: &str,
+) -> Result<String, String> {
+    let normalized = normalize_toggle_shortcut(shortcut);
+    let mut current = state.visibility_shortcut.lock().map_err(|e| e.to_string())?;
+    if current.as_deref() == Some(normalized.as_str()) {
+        return Ok(normalized);
+    }
+
+    let manager = app.global_shortcut();
+    if let Some(prev) = current.clone() {
+        let _ = manager.unregister(prev.as_str());
+    }
+
+    manager
+        .register(normalized.as_str())
+        .map_err(|e| format!("register shortcut '{normalized}' failed: {e}"))?;
+    *current = Some(normalized.clone());
+    Ok(normalized)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cfg = config::load_config().unwrap_or_else(|_| AppConfig {
@@ -666,6 +894,7 @@ pub fn run() {
             chat_window_opacity: 0.95,
             chat_window_width: 480.0,
             chat_window_height: 640.0,
+            toggle_visibility_shortcut: DEFAULT_TOGGLE_SHORTCUT.to_string(),
             appearance: PetAppearanceConfig::default(),
         },
         llm: LlmConfig::default(),
@@ -678,16 +907,34 @@ pub fn run() {
 
     let state = Arc::new(AppState {
         bridges: Mutex::new(HashMap::new()),
+        tunnels: Mutex::new(HashMap::new()),
         bridge_connect_lock: Mutex::new(()),
         history,
         config: Mutex::new(cfg.clone()),
         tray: StdMutex::new(None),
+        visibility_shortcut: StdMutex::new(None),
+        shutdown_started: StdMutex::new(false),
     });
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler({
+                    let state_for_shortcut = state.clone();
+                    move |app, _shortcut, event| {
+                        if event.state() != ShortcutState::Pressed {
+                            return;
+                        }
+                        if let Err(err) = toggle_main_window_visibility(app, &state_for_shortcut) {
+                            eprintln!("global shortcut toggle failed: {err}");
+                        }
+                    }
+                })
+                .build(),
+        )
         .manage(state.clone())
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -695,6 +942,9 @@ pub fn run() {
 
             if let Err(err) = build_tray(&app.handle(), &state) {
                 eprintln!("failed to initialize tray icon: {err}");
+            }
+            if let Err(err) = apply_toggle_shortcut(&app.handle(), &state, &cfg.pet.toggle_visibility_shortcut) {
+                eprintln!("failed to register global shortcut '{}': {err}", cfg.pet.toggle_visibility_shortcut);
             }
 
             if let Some(win) = app.get_webview_window("main") {
@@ -727,10 +977,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_config,
             save_config,
+            start_ssh_tunnel,
+            stop_ssh_tunnel,
+            get_ssh_tunnel_status,
             connect_bridge,
             disconnect_bridge,
             get_bridge_status,
             send_message,
+            send_card_action,
             send_file,
             get_history,
             clear_history,
@@ -741,6 +995,7 @@ pub fn run() {
             llm_generate_image,
             reveal_file,
             quit_app,
+            toggle_window_visibility,
             check_for_updates,
             fetch_link_preview,
             list_bridge_sessions,
@@ -750,11 +1005,21 @@ pub fn run() {
             switch_bridge_session,
             delete_bridge_session,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .unwrap_or_else(|err| {
-            eprintln!("error while running tauri application: {err}");
+            eprintln!("error while building tauri application: {err}");
             std::process::exit(1);
         });
+
+    app.run(|handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            let state = handle.state::<Arc<AppState>>();
+            tauri::async_runtime::block_on(shutdown_network_resources(state.inner()));
+        }
+    });
 }
 
 fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
@@ -762,6 +1027,9 @@ fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), Strin
     use tauri::tray::TrayIconBuilder;
 
     let chat = MenuItemBuilder::with_id("chat", "打开聊天")
+        .build(app)
+        .map_err(|e| e.to_string())?;
+    let toggle_visibility = MenuItemBuilder::with_id("toggle_visibility", "隐藏 / 显示")
         .build(app)
         .map_err(|e| e.to_string())?;
     let settings = MenuItemBuilder::with_id("settings", "设置")
@@ -776,6 +1044,7 @@ fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), Strin
 
     let menu = MenuBuilder::new(app)
         .item(&chat)
+        .item(&toggle_visibility)
         .separator()
         .item(&settings)
         .item(&check_update)
@@ -786,6 +1055,7 @@ fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), Strin
 
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))
         .expect("failed to load tray icon");
+    let state_for_menu = Arc::clone(state);
 
     let tray = TrayIconBuilder::new()
         .icon(icon)
@@ -794,13 +1064,20 @@ fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), Strin
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "chat" => {
                 let _ = app.emit("toggle-chat", ());
+                let _ = reveal_main_window_if_hidden(app, &state_for_menu);
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.show();
                     let _ = win.set_focus();
                 }
             }
+            "toggle_visibility" => {
+                if let Err(err) = toggle_main_window_visibility(app, &state_for_menu) {
+                    eprintln!("toggle visibility failed: {err}");
+                }
+            }
             "settings" => {
                 let _ = app.emit("toggle-settings", ());
+                let _ = reveal_main_window_if_hidden(app, &state_for_menu);
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.show();
                     let _ = win.set_focus();
@@ -808,12 +1085,15 @@ fn build_tray(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), Strin
             }
             "check_update" => {
                 let _ = app.emit("manual-check-updates", ());
+                let _ = reveal_main_window_if_hidden(app, &state_for_menu);
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.show();
                     let _ = win.set_focus();
                 }
             }
             "quit" => {
+                let state = app.state::<Arc<AppState>>();
+                tauri::async_runtime::block_on(shutdown_network_resources(state.inner()));
                 app.exit(0);
             }
             _ => {}

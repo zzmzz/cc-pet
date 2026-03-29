@@ -8,6 +8,8 @@ import type {
   BridgeSessionsData,
   LocalSessionsData,
   LinkPreviewData,
+  SshTunnelConfig,
+  SshTunnelStatus,
 } from "./types";
 
 export async function loadConfig(): Promise<AppConfig> {
@@ -24,6 +26,21 @@ export async function connectBridge(connectionId: string): Promise<void> {
 
 export async function disconnectBridge(connectionId: string): Promise<void> {
   return invoke("disconnect_bridge", { connectionId });
+}
+
+export async function startSshTunnel(
+  connectionId: string,
+  tunnelConfig?: SshTunnelConfig
+): Promise<void> {
+  return invoke("start_ssh_tunnel", { connectionId, tunnelConfig: tunnelConfig ?? null });
+}
+
+export async function stopSshTunnel(connectionId: string): Promise<void> {
+  return invoke("stop_ssh_tunnel", { connectionId });
+}
+
+export async function getSshTunnelStatus(): Promise<SshTunnelStatus[]> {
+  return invoke("get_ssh_tunnel_status");
 }
 
 export async function getBridgeStatus(): Promise<ConnectionStatus[]> {
@@ -81,6 +98,20 @@ export async function sendMessage(
   });
 }
 
+export async function sendCardAction(
+  connectionId: string,
+  action: string,
+  sessionKey?: string,
+  replyCtx?: string,
+): Promise<void> {
+  return invoke("send_card_action", {
+    connectionId,
+    action,
+    sessionKey: sessionKey ?? null,
+    replyCtx: replyCtx ?? null,
+  });
+}
+
 export async function sendFile(
   connectionId: string,
   path: string,
@@ -126,6 +157,10 @@ export async function setMainWindowSize(
   height: number
 ): Promise<void> {
   return invoke("set_main_window_size", { width, height });
+}
+
+export async function togglePetVisibility(): Promise<void> {
+  return invoke("toggle_window_visibility");
 }
 
 export async function llmChat(messages: LlmMessage[]): Promise<string> {

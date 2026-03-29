@@ -10,6 +10,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore, makeChatKey } from "@/lib/store";
 import {
   sendMessage,
+  sendCardAction,
   sendFile,
   clearHistory,
   revealFile,
@@ -21,7 +22,7 @@ import {
 } from "@/lib/commands";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { ChatMessage, LinkPreviewData } from "@/lib/types";
+import type { ChatButtonOption, ChatMessage, LinkPreviewData, SessionTaskState } from "@/lib/types";
 import { SlashCommandMenu, useSlashMenu, getFilteredCommands } from "./SlashCommandMenu";
 import type { SlashCommand } from "./SlashCommandMenu";
 import { SessionDropdown } from "./SessionDropdown";
@@ -35,6 +36,15 @@ const FILE_LINK_EXTS = new Set([
 ]);
 const LINK_PREVIEW_CACHE = new Map<string, LinkPreviewData | null>();
 const LINK_PREVIEW_INFLIGHT = new Map<string, Promise<LinkPreviewData | null>>();
+const NON_STREAM_COMPLETE_DEBOUNCE_MS = 1200;
+const DEFAULT_TASK_STATE: SessionTaskState = {
+  activeRequestId: null,
+  phase: "idle",
+  startedAt: null,
+  lastActivityAt: null,
+  firstTokenAt: null,
+  stalledReason: null,
+};
 
 function isNearBottom(el: HTMLDivElement, threshold = NEAR_BOTTOM_PX) {
   return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
@@ -226,7 +236,84 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function MessageBubble({ msg }: { msg: ChatMessage }) {
+function ButtonsBubble({
+  msg,
+  onButtonAction,
+  onCustomButtonInput,
+}: {
+  msg: ChatMessage;
+  onButtonAction: (msg: ChatMessage, option: ChatButtonOption) => void;
+  onCustomButtonInput: (msg: ChatMessage, text: string) => void;
+}) {
+  const [customText, setCustomText] = useState("");
+  const canSendCustom = customText.trim().length > 0;
+  const buttonRows = msg.buttons ?? [];
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10, scale: 0.97 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      transition={{ duration: 0.2 }}
+      className="flex justify-start px-3 py-1"
+    >
+      <div className="max-w-[85%] min-w-0 overflow-hidden rounded-2xl px-4 py-2.5 text-[13.5px] leading-relaxed bg-gray-100 text-gray-800 rounded-bl-md">
+        <p className="whitespace-pre-wrap break-words">{msg.content}</p>
+        <div className="mt-2 space-y-1.5">
+          {buttonRows.map((row, rowIdx) => (
+            <div key={`btn-row-${msg.id}-${rowIdx}`} className="flex flex-wrap gap-1.5">
+              {row.map((option, optionIdx) => (
+                <button
+                  key={`btn-${msg.id}-${rowIdx}-${optionIdx}`}
+                  type="button"
+                  onClick={() => onButtonAction(msg, option)}
+                  className="rounded border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] text-indigo-700 hover:bg-indigo-100"
+                >
+                  {option.text}
+                </button>
+              ))}
+            </div>
+          ))}
+          <div className="flex items-center gap-1.5">
+            <input
+              value={customText}
+              onChange={(e) => setCustomText(e.target.value)}
+              placeholder="输入自定义内容"
+              className="min-w-0 flex-1 rounded border border-gray-200 bg-white px-2 py-1 text-[11px] outline-none focus:border-indigo-400"
+            />
+            <button
+              type="button"
+              disabled={!canSendCustom}
+              onClick={() => {
+                const text = customText.trim();
+                if (!text) return;
+                onCustomButtonInput(msg, text);
+                setCustomText("");
+              }}
+              className="rounded bg-indigo-500 px-2.5 py-1 text-[11px] text-white disabled:opacity-40"
+            >
+              发送自定义
+            </button>
+          </div>
+        </div>
+        <div className="text-[10px] mt-1 text-gray-400">
+          {new Date(msg.timestamp).toLocaleTimeString("zh-CN", {
+            hour: "2-digit",
+            minute: "2-digit",
+          })}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+function MessageBubble({
+  msg,
+  onButtonAction,
+  onCustomButtonInput,
+}: {
+  msg: ChatMessage;
+  onButtonAction: (msg: ChatMessage, option: ChatButtonOption) => void;
+  onCustomButtonInput: (msg: ChatMessage, text: string) => void;
+}) {
   const isUser = msg.role === "user";
 
   if (msg.contentType === "file") {
@@ -282,6 +369,16 @@ function MessageBubble({ msg }: { msg: ChatMessage }) {
           </div>
         </div>
       </motion.div>
+    );
+  }
+
+  if (msg.contentType === "buttons") {
+    return (
+      <ButtonsBubble
+        msg={msg}
+        onButtonAction={onButtonAction}
+        onCustomButtonInput={onCustomButtonInput}
+      />
     );
   }
 
@@ -389,8 +486,14 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     updateMessage,
     clearMessages,
     clearSessionUnread,
+    sessionTaskStateByConnection,
+    setSessionTaskState,
+    patchSessionTaskState,
+    clearSessionTaskState,
+    hasAnyUnread,
     setPetState,
     agentCommands,
+    config,
   } = useAppStore();
 
   const activeSessionKey = activeConnectionId
@@ -401,6 +504,12 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     activeConnectionId && activeSessionKey
       ? (messagesByChat[makeChatKey(activeConnectionId, activeSessionKey)] ?? [])
       : [];
+  const activeTaskState =
+    activeConnectionId && activeSessionKey
+      ? (sessionTaskStateByConnection[activeConnectionId]?.[activeSessionKey] ?? DEFAULT_TASK_STATE)
+      : DEFAULT_TASK_STATE;
+  const firstTokenTimeoutMs = Math.max(0, config?.pet.firstTokenTimeoutMs ?? 0);
+  const streamIdleTimeoutMs = Math.max(0, config?.pet.streamIdleTimeoutMs ?? 0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -409,6 +518,9 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const [updateChecking, setUpdateChecking] = useState(false);
   const [showJumpLatest, setShowJumpLatest] = useState(false);
   const bridgeStreamBotIdRef = useRef<string | null>(null);
+  const softCompleteTimersRef = useRef<Record<string, number>>({});
+  const typingActiveRef = useRef<Record<string, boolean>>({});
+  const chatOpacity = Math.min(1, Math.max(0.5, config?.pet.chatWindowOpacity ?? 0.97));
 
   const { isActive: slashMenuVisible, query: slashQuery } = useSlashMenu(input);
 
@@ -472,6 +584,82 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     if (chatOpen) inputRef.current?.focus();
   }, [chatOpen]);
 
+  const beginSessionRequest = useCallback(
+    (connectionId: string, sessionKey: string) => {
+      const now = Date.now();
+      const requestId = `req-${now}-${Math.random().toString(16).slice(2, 8)}`;
+      setSessionTaskState(connectionId, sessionKey, {
+        activeRequestId: requestId,
+        phase: "thinking",
+        startedAt: now,
+        lastActivityAt: now,
+        firstTokenAt: null,
+        stalledReason: null,
+      });
+      setPetState("thinking");
+    },
+    [setSessionTaskState, setPetState],
+  );
+
+  const markSessionFailed = useCallback(
+    (connectionId: string, sessionKey: string) => {
+      const key = makeChatKey(connectionId, sessionKey);
+      const existingTimer = softCompleteTimersRef.current[key];
+      if (existingTimer) {
+        window.clearTimeout(existingTimer);
+        delete softCompleteTimersRef.current[key];
+      }
+      patchSessionTaskState(connectionId, sessionKey, {
+        activeRequestId: null,
+        phase: "failed",
+        lastActivityAt: Date.now(),
+      });
+      setPetState("error");
+      setTimeout(() => setPetState("idle"), 3000);
+    },
+    [patchSessionTaskState, setPetState],
+  );
+
+  const clearSoftCompletedTimer = useCallback((connectionId: string, sessionKey: string) => {
+    const key = makeChatKey(connectionId, sessionKey);
+    const existingTimer = softCompleteTimersRef.current[key];
+    if (!existingTimer) return;
+    window.clearTimeout(existingTimer);
+    delete softCompleteTimersRef.current[key];
+  }, []);
+
+  const scheduleSoftCompleted = useCallback(
+    (connectionId: string, sessionKey: string) => {
+      const key = makeChatKey(connectionId, sessionKey);
+      const existingTimer = softCompleteTimersRef.current[key];
+      if (existingTimer) {
+        window.clearTimeout(existingTimer);
+      }
+      softCompleteTimersRef.current[key] = window.setTimeout(() => {
+        delete softCompleteTimersRef.current[key];
+        if (typingActiveRef.current[key]) {
+          return;
+        }
+        const store = useAppStore.getState();
+        const current = store.sessionTaskStateByConnection[connectionId]?.[sessionKey];
+        if (!current) return;
+        if (current.phase !== "working" && current.phase !== "thinking") return;
+        store.patchSessionTaskState(connectionId, sessionKey, {
+          activeRequestId: null,
+          phase: "completed",
+          lastActivityAt: Date.now(),
+          stalledReason: null,
+        });
+        if (store.hasAnyUnread()) {
+          store.setPetState("talking");
+        } else {
+          store.setPetState("idle");
+        }
+      }, NON_STREAM_COMPLETE_DEBOUNCE_MS);
+    },
+    [],
+  );
+
   // 当激活连接变化时，从后端拉取会话列表
   useEffect(() => {
     if (!activeConnectionId) return;
@@ -522,6 +710,17 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
         if (cancelled) return;
         const store = useAppStore.getState();
         const { connectionId, sessionKey, delta } = e.payload;
+        clearSoftCompletedTimer(connectionId, sessionKey);
+        const now = Date.now();
+        const task = store.sessionTaskStateByConnection[connectionId]?.[sessionKey];
+        store.patchSessionTaskState(connectionId, sessionKey, {
+          activeRequestId: task?.activeRequestId ?? `incoming-${now}`,
+          phase: "working",
+          startedAt: task?.startedAt ?? now,
+          firstTokenAt: task?.firstTokenAt ?? now,
+          lastActivityAt: now,
+          stalledReason: null,
+        });
         let id = bridgeStreamBotIdRef.current;
         if (!id) {
           const activeSession = store.activeSessionByConnection[connectionId];
@@ -540,9 +739,6 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
             contentType: "text",
             timestamp: Date.now(),
           });
-          if (!shouldMarkUnread) {
-            store.setPetState("talking");
-          }
         } else {
           const chatKey = makeChatKey(connectionId, sessionKey);
           const prev =
@@ -562,6 +758,13 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
         if (cancelled) return;
         const store = useAppStore.getState();
         const { connectionId, sessionKey, fullText } = e.payload;
+        clearSoftCompletedTimer(connectionId, sessionKey);
+        store.patchSessionTaskState(connectionId, sessionKey, {
+          activeRequestId: null,
+          phase: "completed",
+          lastActivityAt: Date.now(),
+          stalledReason: null,
+        });
         const id = bridgeStreamBotIdRef.current;
         if (id) {
           if (fullText.length > 0) {
@@ -594,15 +797,241 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
       });
       if (cancelled) { u4(); return; }
       unlistenFns.push(u4);
+
+      const u5 = await listen<{
+        connectionId: string;
+        sessionKey?: string;
+      }>("bridge-message", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const sessionKey = e.payload.sessionKey ?? store.activeSessionByConnection[e.payload.connectionId];
+        if (!sessionKey) return;
+        const current = store.sessionTaskStateByConnection[e.payload.connectionId]?.[sessionKey];
+        const now = Date.now();
+        store.patchSessionTaskState(e.payload.connectionId, sessionKey, {
+          activeRequestId: current.activeRequestId ?? `incoming-${now}`,
+          phase: "working",
+          startedAt: current.startedAt ?? now,
+          firstTokenAt: current.firstTokenAt ?? now,
+          lastActivityAt: now,
+          stalledReason: null,
+        });
+        scheduleSoftCompleted(e.payload.connectionId, sessionKey);
+      });
+      if (cancelled) { u5(); return; }
+      unlistenFns.push(u5);
+
+      const u5b = await listen<{
+        connectionId: string;
+        sessionKey?: string;
+      }>("bridge-buttons", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const sessionKey = e.payload.sessionKey ?? store.activeSessionByConnection[e.payload.connectionId];
+        if (!sessionKey) return;
+        const current = store.sessionTaskStateByConnection[e.payload.connectionId]?.[sessionKey];
+        const now = Date.now();
+        clearSoftCompletedTimer(e.payload.connectionId, sessionKey);
+        store.patchSessionTaskState(e.payload.connectionId, sessionKey, {
+          activeRequestId: current?.activeRequestId ?? `incoming-${now}`,
+          phase: "awaiting_confirmation",
+          startedAt: current?.startedAt ?? now,
+          firstTokenAt: current?.firstTokenAt ?? now,
+          lastActivityAt: now,
+          stalledReason: null,
+        });
+      });
+      if (cancelled) { u5b(); return; }
+      unlistenFns.push(u5b);
+
+      const u6 = await listen<{
+        connectionId: string;
+      }>("bridge-error", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const sessionKey = store.activeSessionByConnection[e.payload.connectionId];
+        if (!sessionKey) return;
+        store.patchSessionTaskState(e.payload.connectionId, sessionKey, {
+          activeRequestId: null,
+          phase: "failed",
+          lastActivityAt: Date.now(),
+        });
+      });
+      if (cancelled) { u6(); return; }
+      unlistenFns.push(u6);
+
+      const u7 = await listen<{
+        connectionId: string;
+        sessionKey?: string;
+      }>("bridge-typing-start", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const sessionKey = e.payload.sessionKey ?? store.activeSessionByConnection[e.payload.connectionId];
+        if (!sessionKey) return;
+        clearSoftCompletedTimer(e.payload.connectionId, sessionKey);
+        typingActiveRef.current[makeChatKey(e.payload.connectionId, sessionKey)] = true;
+        const current = store.sessionTaskStateByConnection[e.payload.connectionId]?.[sessionKey];
+        const now = Date.now();
+        store.patchSessionTaskState(e.payload.connectionId, sessionKey, {
+          activeRequestId: current?.activeRequestId ?? `incoming-${now}`,
+          phase: "thinking",
+          startedAt: current?.startedAt ?? now,
+          firstTokenAt: current?.firstTokenAt ?? null,
+          lastActivityAt: now,
+          stalledReason: null,
+        });
+      });
+      if (cancelled) { u7(); return; }
+      unlistenFns.push(u7);
+
+      const u8 = await listen<{
+        connectionId: string;
+        sessionKey?: string;
+      }>("bridge-typing-stop", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const sessionKey = e.payload.sessionKey ?? store.activeSessionByConnection[e.payload.connectionId];
+        if (!sessionKey) return;
+        typingActiveRef.current[makeChatKey(e.payload.connectionId, sessionKey)] = false;
+        clearSoftCompletedTimer(e.payload.connectionId, sessionKey);
+        const current = store.sessionTaskStateByConnection[e.payload.connectionId]?.[sessionKey];
+        if (!current || (current.phase !== "thinking" && current.phase !== "working")) return;
+        store.patchSessionTaskState(e.payload.connectionId, sessionKey, {
+          activeRequestId: null,
+          phase: "completed",
+          lastActivityAt: Date.now(),
+          stalledReason: null,
+        });
+        if (store.hasAnyUnread()) {
+          store.setPetState("talking");
+        } else {
+          store.setPetState("idle");
+        }
+      });
+      if (cancelled) { u8(); return; }
+      unlistenFns.push(u8);
+
+      const u9 = await listen<{
+        connectionId: string;
+        sessionKey?: string;
+      }>("bridge-preview-start", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const sessionKey = e.payload.sessionKey ?? store.activeSessionByConnection[e.payload.connectionId];
+        if (!sessionKey) return;
+        clearSoftCompletedTimer(e.payload.connectionId, sessionKey);
+        const current = store.sessionTaskStateByConnection[e.payload.connectionId]?.[sessionKey];
+        const now = Date.now();
+        store.patchSessionTaskState(e.payload.connectionId, sessionKey, {
+          activeRequestId: current?.activeRequestId ?? `incoming-${now}`,
+          phase: "working",
+          startedAt: current?.startedAt ?? now,
+          firstTokenAt: current?.firstTokenAt ?? now,
+          lastActivityAt: now,
+          stalledReason: null,
+        });
+      });
+      if (cancelled) { u9(); return; }
+      unlistenFns.push(u9);
+
+      const u10 = await listen<{
+        connectionId: string;
+        sessionKey?: string;
+      }>("bridge-preview-update", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const sessionKey = e.payload.sessionKey ?? store.activeSessionByConnection[e.payload.connectionId];
+        if (!sessionKey) return;
+        clearSoftCompletedTimer(e.payload.connectionId, sessionKey);
+        const current = store.sessionTaskStateByConnection[e.payload.connectionId]?.[sessionKey];
+        const now = Date.now();
+        store.patchSessionTaskState(e.payload.connectionId, sessionKey, {
+          activeRequestId: current?.activeRequestId ?? `incoming-${now}`,
+          phase: "working",
+          startedAt: current?.startedAt ?? now,
+          firstTokenAt: current?.firstTokenAt ?? now,
+          lastActivityAt: now,
+          stalledReason: null,
+        });
+      });
+      if (cancelled) { u10(); return; }
+      unlistenFns.push(u10);
     }
 
     setup();
 
     return () => {
       cancelled = true;
+      for (const timerId of Object.values(softCompleteTimersRef.current)) {
+        window.clearTimeout(timerId);
+      }
+      softCompleteTimersRef.current = {};
+      typingActiveRef.current = {};
       unlistenFns.forEach((fn) => fn());
     };
-  }, []);
+  }, [clearSoftCompletedTimer, scheduleSoftCompleted]);
+
+  useEffect(() => {
+    if (firstTokenTimeoutMs <= 0 && streamIdleTimeoutMs <= 0) return;
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      const store = useAppStore.getState();
+      for (const [connectionId, bySession] of Object.entries(store.sessionTaskStateByConnection)) {
+        for (const [sessionKey, task] of Object.entries(bySession)) {
+          if (task.phase === "thinking" && firstTokenTimeoutMs > 0 && task.startedAt) {
+            if (now - task.startedAt >= firstTokenTimeoutMs) {
+              store.patchSessionTaskState(connectionId, sessionKey, {
+                activeRequestId: null,
+                phase: "stalled",
+                lastActivityAt: now,
+                stalledReason: "first_token_timeout",
+              });
+            }
+            continue;
+          }
+          if (task.phase === "working" && streamIdleTimeoutMs > 0 && task.lastActivityAt) {
+            if (now - task.lastActivityAt >= streamIdleTimeoutMs) {
+              store.patchSessionTaskState(connectionId, sessionKey, {
+                activeRequestId: null,
+                phase: "stalled",
+                lastActivityAt: now,
+                stalledReason: "stream_idle_timeout",
+              });
+            }
+          }
+        }
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [firstTokenTimeoutMs, streamIdleTimeoutMs]);
+
+  useEffect(() => {
+    if (!activeConnectionId || !activeSessionKey) return;
+    if (activeTaskState.phase !== "completed" && activeTaskState.phase !== "failed") return;
+    const timer = window.setTimeout(() => {
+      clearSessionTaskState(activeConnectionId, activeSessionKey);
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeConnectionId,
+    activeSessionKey,
+    activeTaskState.phase,
+    clearSessionTaskState,
+  ]);
+
+  useEffect(() => {
+    if (!activeConnectionId || !activeSessionKey) return;
+    if (hasAnyUnread()) return;
+    if (activeTaskState.phase === "thinking" || activeTaskState.phase === "working") {
+      setPetState("thinking");
+    }
+  }, [
+    activeConnectionId,
+    activeSessionKey,
+    activeTaskState.phase,
+    hasAnyUnread,
+    setPetState,
+  ]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
@@ -620,15 +1049,21 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     };
     addMessage(activeConnectionId, activeSessionKey, userMsg);
 
-    setPetState("thinking");
+    beginSessionRequest(activeConnectionId, activeSessionKey);
     try {
       await sendMessage(activeConnectionId, text, activeSessionKey);
     } catch (e) {
       console.error("send failed:", e);
-      setPetState("error");
-      setTimeout(() => setPetState("idle"), 3000);
+      markSessionFailed(activeConnectionId, activeSessionKey);
     }
-  }, [input, activeConnectionId, activeSessionKey, addMessage, setPetState]);
+  }, [
+    input,
+    activeConnectionId,
+    activeSessionKey,
+    addMessage,
+    beginSessionRequest,
+    markSessionFailed,
+  ]);
 
   const handleAttach = useCallback(async () => {
     if (!activeConnectionId || !activeSessionKey) return;
@@ -649,9 +1084,48 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
         await sendFile(activeConnectionId, path, activeSessionKey);
       } catch (e) {
         console.error("send file failed:", e);
+        markSessionFailed(activeConnectionId, activeSessionKey);
       }
     }
-  }, [activeConnectionId, activeSessionKey, addMessage]);
+  }, [activeConnectionId, activeSessionKey, addMessage, markSessionFailed]);
+
+  const handleButtonAction = useCallback(
+    async (msg: ChatMessage, option: ChatButtonOption) => {
+      if (!activeConnectionId || !activeSessionKey) return;
+      if (!option.data) return;
+      try {
+        await sendCardAction(activeConnectionId, option.data, msg.sessionKey, msg.replyCtx);
+      } catch (e) {
+        console.error("send card action failed:", e);
+        markSessionFailed(activeConnectionId, activeSessionKey);
+      }
+    },
+    [activeConnectionId, activeSessionKey, markSessionFailed],
+  );
+
+  const handleCustomButtonInput = useCallback(
+    async (msg: ChatMessage, text: string) => {
+      if (!activeConnectionId || !activeSessionKey) return;
+      addMessage(activeConnectionId, msg.sessionKey, {
+        id: `user-${Date.now()}`,
+        connectionId: activeConnectionId,
+        sessionKey: msg.sessionKey,
+        replyCtx: msg.replyCtx,
+        role: "user",
+        content: text,
+        contentType: "text",
+        timestamp: Date.now(),
+      });
+      beginSessionRequest(activeConnectionId, msg.sessionKey);
+      try {
+        await sendMessage(activeConnectionId, text, msg.sessionKey, msg.replyCtx);
+      } catch (e) {
+        console.error("send custom input failed:", e);
+        markSessionFailed(activeConnectionId, activeSessionKey);
+      }
+    },
+    [activeConnectionId, activeSessionKey, addMessage, beginSessionRequest, markSessionFailed],
+  );
 
   const handleSlashSelect = useCallback(
     async (cmd: SlashCommand) => {
@@ -664,6 +1138,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
             if (activeConnectionId && activeSessionKey) {
               clearHistory(activeConnectionId).catch(console.error);
               clearMessages(activeConnectionId, activeSessionKey);
+              clearSessionTaskState(activeConnectionId, activeSessionKey);
             }
             break;
           case "/settings":
@@ -687,19 +1162,27 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
           timestamp: Date.now(),
         };
         addMessage(activeConnectionId, activeSessionKey, userMsg);
-        setPetState("thinking");
+        beginSessionRequest(activeConnectionId, activeSessionKey);
         try {
           await sendMessage(activeConnectionId, cmd.command, activeSessionKey);
         } catch (e) {
           console.error("send failed:", e);
-          setPetState("error");
-          setTimeout(() => setPetState("idle"), 3000);
+          markSessionFailed(activeConnectionId, activeSessionKey);
         }
       }
 
       inputRef.current?.focus();
     },
-    [activeConnectionId, activeSessionKey, addMessage, setPetState, clearMessages, setSettingsOpen]
+    [
+      activeConnectionId,
+      activeSessionKey,
+      addMessage,
+      beginSessionRequest,
+      markSessionFailed,
+      clearMessages,
+      clearSessionTaskState,
+      setSettingsOpen,
+    ]
   );
 
   const handleKeyDown = useCallback(
@@ -759,11 +1242,13 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     <AnimatePresence>
       {chatOpen && (
         <motion.div
+          data-testid="chat-window-panel"
           initial={{ opacity: 0, scale: 0.9, y: 20 }}
           animate={{ opacity: 1, scale: 1, y: 0 }}
           exit={{ opacity: 0, scale: 0.9, y: 20 }}
           transition={{ type: "spring", damping: 25, stiffness: 300 }}
-          className="absolute inset-0 flex flex-col bg-white/[0.97] backdrop-blur-sm rounded-2xl border border-gray-200 shadow-2xl overflow-hidden z-10"
+          className="absolute inset-0 flex flex-col backdrop-blur-sm rounded-2xl border border-gray-200 shadow-2xl overflow-hidden z-10"
+          style={{ backgroundColor: `rgba(255, 255, 255, ${chatOpacity})` }}
         >
           {/* Title bar */}
           <div
@@ -775,10 +1260,14 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
               e.preventDefault();
               getCurrentWindow().startDragging().catch(console.error);
             }}
-            data-tauri-drag-region
+            onDoubleClick={(e) => {
+              // Avoid native drag-region double-click maximize on Windows.
+              e.preventDefault();
+              e.stopPropagation();
+            }}
           >
             <SessionDropdown />
-            <div className="flex-1" data-tauri-drag-region />
+            <div className="flex-1" />
             <button
               type="button"
               title="检查更新"
@@ -808,6 +1297,7 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
                 if (activeConnectionId && activeSessionKey) {
                   clearHistory(activeConnectionId).catch(console.error);
                   clearMessages(activeConnectionId, activeSessionKey);
+                  clearSessionTaskState(activeConnectionId, activeSessionKey);
                 }
               }}
               className="text-[11px] text-gray-400 hover:text-red-500 transition-colors mr-2"
@@ -835,7 +1325,12 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
                 </div>
               )}
               {messages.map((msg) => (
-                <MessageBubble key={msg.id} msg={msg} />
+                <MessageBubble
+                  key={msg.id}
+                  msg={msg}
+                  onButtonAction={handleButtonAction}
+                  onCustomButtonInput={handleCustomButtonInput}
+                />
               ))}
             </div>
             {showJumpLatest && (

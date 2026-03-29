@@ -1,5 +1,11 @@
 import { create } from "zustand";
-import type { ChatMessage, PetState, AppConfig, BridgeConfig } from "./types";
+import type {
+  ChatMessage,
+  PetState,
+  AppConfig,
+  BridgeConfig,
+  SessionTaskState,
+} from "./types";
 import type { SlashCommand } from "@/components/SlashCommandMenu";
 import { updateSessionLabel } from "./commands";
 
@@ -23,6 +29,15 @@ function autoTitle(content: string): string {
 type ConnectionEntry = {
   connected: boolean;
   config: BridgeConfig;
+};
+
+const DEFAULT_SESSION_TASK_STATE: SessionTaskState = {
+  activeRequestId: null,
+  phase: "idle",
+  startedAt: null,
+  lastActivityAt: null,
+  firstTokenAt: null,
+  stalledReason: null,
 };
 
 interface AppStore {
@@ -57,6 +72,17 @@ interface AppStore {
   updateMessage: (connectionId: string, sessionKey: string, id: string, partial: Partial<ChatMessage>) => void;
   clearMessages: (connectionId: string, sessionKey: string) => void;
   setMessages: (connectionId: string, sessionKey: string, msgs: ChatMessage[]) => void;
+
+  // task state per session
+  sessionTaskStateByConnection: Record<string, Record<string, SessionTaskState>>;
+  setSessionTaskState: (connectionId: string, sessionKey: string, task: SessionTaskState) => void;
+  patchSessionTaskState: (
+    connectionId: string,
+    sessionKey: string,
+    partial: Partial<SessionTaskState>,
+  ) => void;
+  clearSessionTaskState: (connectionId: string, sessionKey: string) => void;
+  getActiveSessionTaskState: () => SessionTaskState;
 
   // pet
   petState: PetState;
@@ -106,9 +132,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
         state.activeConnectionId && next[state.activeConnectionId]
           ? state.activeConnectionId
           : configs[0]?.id ?? null;
+      const nextTaskStateByConnection: Record<string, Record<string, SessionTaskState>> = {};
+      for (const id of Object.keys(next)) {
+        if (state.sessionTaskStateByConnection[id]) {
+          nextTaskStateByConnection[id] = state.sessionTaskStateByConnection[id];
+        }
+      }
       return {
         connections: next,
         activeConnectionId,
+        sessionTaskStateByConnection: nextTaskStateByConnection,
         connected: Object.values(next).some((c) => c.connected),
       };
     }),
@@ -265,6 +298,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const wasActive = state.activeSessionByConnection[connectionId] === sessionId;
       const newActive = wasActive ? sessions[0] ?? "" : state.activeSessionByConnection[connectionId];
       const anyUnread = hasAnyUnreadInMap(nextUnreadByConnection);
+      const taskStateBySession = {
+        ...(state.sessionTaskStateByConnection[connectionId] ?? {}),
+      };
+      delete taskStateBySession[sessionId];
+      const nextTaskStateByConnection = { ...state.sessionTaskStateByConnection };
+      if (Object.keys(taskStateBySession).length === 0) {
+        delete nextTaskStateByConnection[connectionId];
+      } else {
+        nextTaskStateByConnection[connectionId] = taskStateBySession;
+      }
 
       return {
         sessionsByConnection: { ...state.sessionsByConnection, [connectionId]: sessions },
@@ -275,12 +318,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
         sessionLabelsByConnection: { ...state.sessionLabelsByConnection, [connectionId]: labels },
         sessionLastActiveByConnection: { ...state.sessionLastActiveByConnection, [connectionId]: lastActive },
         sessionUnreadByConnection: nextUnreadByConnection,
+        sessionTaskStateByConnection: nextTaskStateByConnection,
         petState: !anyUnread && state.petState === "talking" ? "idle" : state.petState,
       };
     }),
 
   // ── messages ──
   messagesByChat: {},
+  sessionTaskStateByConnection: {},
 
   addMessage: (connectionId, sessionKey, msg) =>
     set((state) => {
@@ -368,6 +413,60 @@ export const useAppStore = create<AppStore>((set, get) => ({
         ...labelUpdate,
       };
     }),
+
+  setSessionTaskState: (connectionId, sessionKey, task) =>
+    set((state) => ({
+      sessionTaskStateByConnection: {
+        ...state.sessionTaskStateByConnection,
+        [connectionId]: {
+          ...(state.sessionTaskStateByConnection[connectionId] ?? {}),
+          [sessionKey]: task,
+        },
+      },
+    })),
+
+  patchSessionTaskState: (connectionId, sessionKey, partial) =>
+    set((state) => {
+      const prev =
+        state.sessionTaskStateByConnection[connectionId]?.[sessionKey] ??
+        DEFAULT_SESSION_TASK_STATE;
+      return {
+        sessionTaskStateByConnection: {
+          ...state.sessionTaskStateByConnection,
+          [connectionId]: {
+            ...(state.sessionTaskStateByConnection[connectionId] ?? {}),
+            [sessionKey]: { ...prev, ...partial },
+          },
+        },
+      };
+    }),
+
+  clearSessionTaskState: (connectionId, sessionKey) =>
+    set((state) => {
+      const bySession = state.sessionTaskStateByConnection[connectionId];
+      if (!bySession || !bySession[sessionKey]) return state;
+      const nextBySession = { ...bySession };
+      delete nextBySession[sessionKey];
+      const nextByConnection = { ...state.sessionTaskStateByConnection };
+      if (Object.keys(nextBySession).length === 0) {
+        delete nextByConnection[connectionId];
+      } else {
+        nextByConnection[connectionId] = nextBySession;
+      }
+      return { sessionTaskStateByConnection: nextByConnection };
+    }),
+
+  getActiveSessionTaskState: () => {
+    const state = get();
+    const activeConnectionId = state.activeConnectionId;
+    if (!activeConnectionId) return DEFAULT_SESSION_TASK_STATE;
+    const activeSessionKey = state.activeSessionByConnection[activeConnectionId];
+    if (!activeSessionKey) return DEFAULT_SESSION_TASK_STATE;
+    return (
+      state.sessionTaskStateByConnection[activeConnectionId]?.[activeSessionKey] ??
+      DEFAULT_SESSION_TASK_STATE
+    );
+  },
 
   // ── pet ──
   petState: "idle",

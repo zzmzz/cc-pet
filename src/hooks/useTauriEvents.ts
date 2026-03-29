@@ -96,8 +96,6 @@ export function useTauriEvents() {
           }
           if (shouldMarkUnread) {
             markSessionUnread(e.payload.connectionId, sessionKey);
-          } else {
-            setPetState("talking");
           }
           addMessage(e.payload.connectionId, sessionKey, {
             id: `bot-${Date.now()}`,
@@ -114,6 +112,52 @@ export function useTauriEvents() {
       );
       if (cancelled) { u2(); return; }
       unlistenFns.push(u2);
+
+      const u2a = await listen<{
+        connectionId: string;
+        sessionKey?: string;
+        replyCtx?: string;
+        content: string;
+        buttons?: Array<Array<{ text?: string; data?: string }>>;
+      }>("bridge-buttons", (e) => {
+        if (cancelled) return;
+        const store = useAppStore.getState();
+        const knownSessions = store.sessionsByConnection[e.payload.connectionId] ?? [];
+        const sessionKey = resolveIncomingSessionKey({
+          payloadSessionKey: e.payload.sessionKey,
+          replyCtx: e.payload.replyCtx,
+          knownSessions,
+          activeSessionKey: store.activeSessionByConnection[e.payload.connectionId],
+        });
+        const activeSession = store.activeSessionByConnection[e.payload.connectionId];
+        const shouldMarkUnread = !store.chatOpen || activeSession !== sessionKey;
+        ensureSession(e.payload.connectionId, sessionKey);
+        if (!store.activeSessionByConnection[e.payload.connectionId]) {
+          setActiveSessionKey(e.payload.connectionId, sessionKey);
+        }
+        if (shouldMarkUnread) {
+          markSessionUnread(e.payload.connectionId, sessionKey);
+        }
+        const safeButtons = (e.payload.buttons ?? []).map((row) =>
+          row
+            .map((btn) => ({ text: btn?.text ?? "", data: btn?.data ?? "" }))
+            .filter((btn) => btn.text.length > 0 || btn.data.length > 0),
+        );
+        addMessage(e.payload.connectionId, sessionKey, {
+          id: `bot-${Date.now()}`,
+          connectionId: e.payload.connectionId,
+          sessionKey,
+          replyCtx: e.payload.replyCtx,
+          role: "bot",
+          content: e.payload.content,
+          contentType: "buttons",
+          buttons: safeButtons,
+          timestamp: Date.now(),
+        });
+        setTimeout(() => setIdleRespectUnread(), 4000);
+      });
+      if (cancelled) { u2a(); return; }
+      unlistenFns.push(u2a);
 
       const u2b = await listen<{ connectionId: string; sessionKey?: string; replyCtx?: string; name: string; path: string }>(
         "bridge-file-received",

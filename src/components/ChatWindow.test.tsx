@@ -1,13 +1,34 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatWindow } from "./ChatWindow";
 import { useAppStore, makeChatKey, defaultSessionKeyFromBridge } from "@/lib/store";
 import type { BridgeConfig } from "@/lib/types";
 import * as commands from "@/lib/commands";
 
+type EventPayload = Record<string, unknown>;
+type EventListener = (event: { payload: EventPayload }) => void;
+
+const eventHandlers = new Map<string, Set<EventListener>>();
+
+function emitMockEvent(eventName: string, payload: EventPayload) {
+  const handlers = eventHandlers.get(eventName);
+  if (!handlers) return;
+  for (const handler of handlers) handler({ payload });
+}
+
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => () => {}),
+  listen: vi.fn(async (eventName: string, handler: EventListener) => {
+    const existing = eventHandlers.get(eventName) ?? new Set<EventListener>();
+    existing.add(handler);
+    eventHandlers.set(eventName, existing);
+    return () => {
+      const current = eventHandlers.get(eventName);
+      if (!current) return;
+      current.delete(handler);
+      if (current.size === 0) eventHandlers.delete(eventName);
+    };
+  }),
 }));
 
 vi.mock("@tauri-apps/api/window", () => ({
@@ -36,6 +57,7 @@ const TEST_SESSION_ID = defaultSessionKeyFromBridge({
 
 vi.mock("@/lib/commands", () => ({
   sendMessage: vi.fn(async () => {}),
+  sendCardAction: vi.fn(async () => {}),
   sendFile: vi.fn(async () => {}),
   clearHistory: vi.fn(async () => {}),
   revealFile: vi.fn(async () => {}),
@@ -91,11 +113,14 @@ const initialState = useAppStore.getState();
 
 describe("ChatWindow", () => {
   afterEach(() => {
+    vi.useRealTimers();
     cleanup();
   });
 
   beforeEach(() => {
     vi.mocked(commands.sendMessage).mockClear();
+    vi.mocked(commands.sendCardAction).mockClear();
+    eventHandlers.clear();
     useAppStore.setState(initialState, true);
     useAppStore.setState({
       chatOpen: true,
@@ -124,6 +149,299 @@ describe("ChatWindow", () => {
     expect(text).toBe("hello");
     expect(sessionKey).toBe(SESSION);
     expect(useAppStore.getState().messagesByChat[CHAT_KEY]?.[0]?.content).toBe("hello");
+  });
+
+  it("shows thinking first and switches to working after stream delta", async () => {
+    const user = userEvent.setup();
+    render(<ChatWindow />);
+
+    const input = screen.getByPlaceholderText("输入消息，Enter 发送，Shift+Enter 换行");
+    await user.type(input, "hello");
+    await user.click(screen.getByRole("button", { name: "发送" }));
+
+    expect(screen.getByText("思考中")).toBeInTheDocument();
+
+    emitMockEvent("bridge-stream-delta", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+      delta: "ok",
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("处理中")).toBeInTheDocument();
+    });
+  });
+
+  it("uses typing events to drive working and completed status", async () => {
+    render(<ChatWindow />);
+    await waitFor(() => {
+      expect((eventHandlers.get("bridge-typing-start")?.size ?? 0) > 0).toBe(true);
+      expect((eventHandlers.get("bridge-preview-update")?.size ?? 0) > 0).toBe(true);
+      expect((eventHandlers.get("bridge-typing-stop")?.size ?? 0) > 0).toBe(true);
+    });
+
+    emitMockEvent("bridge-typing-start", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+    });
+    await waitFor(() => {
+      expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("thinking");
+    });
+
+    emitMockEvent("bridge-preview-update", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+      content: "part",
+    });
+    await waitFor(() => {
+      expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("working");
+      expect(useAppStore.getState().petState).toBe("thinking");
+    });
+
+    emitMockEvent("bridge-typing-stop", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+    });
+    await waitFor(() => {
+      expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("completed");
+      expect(useAppStore.getState().petState).toBe("idle");
+    });
+  });
+
+  it("does not auto-complete while typing is active", async () => {
+    render(<ChatWindow />);
+    await waitFor(() => {
+      expect((eventHandlers.get("bridge-typing-start")?.size ?? 0) > 0).toBe(true);
+      expect((eventHandlers.get("bridge-message")?.size ?? 0) > 0).toBe(true);
+    });
+    vi.useFakeTimers();
+
+    emitMockEvent("bridge-typing-start", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+    });
+    emitMockEvent("bridge-message", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+      content: "chunk-1",
+    });
+
+    vi.advanceTimersByTime(5_000);
+    expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("working");
+
+    emitMockEvent("bridge-typing-stop", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+    });
+    expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("completed");
+  });
+
+  it("keeps per-session status isolated when switching sessions", async () => {
+    const anotherSession = `${SESSION}-b`;
+    useAppStore.setState({
+      sessionsByConnection: { [testBridge.id]: [SESSION, anotherSession] },
+      activeSessionByConnection: { [testBridge.id]: SESSION },
+    });
+    render(<ChatWindow />);
+
+    useAppStore.getState().setSessionTaskState(testBridge.id, SESSION, {
+      activeRequestId: "req-a",
+      phase: "stalled",
+      startedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      firstTokenAt: null,
+      stalledReason: "first_token_timeout",
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/可能卡住/i)).toBeInTheDocument();
+    });
+
+    useAppStore.getState().setActiveSessionKey(testBridge.id, anotherSession);
+    await waitFor(() => {
+      expect(screen.queryByText(/可能卡住/i)).not.toBeInTheDocument();
+      expect(screen.getByText("空闲")).toBeInTheDocument();
+    });
+  });
+
+  it("shows statuses in title and session list, including idle", async () => {
+    const anotherSession = `${SESSION}-status`;
+    const user = userEvent.setup();
+    vi.mocked(commands.listBridgeSessions).mockResolvedValueOnce({
+      sessions: [
+        { id: SESSION, name: "default", historyCount: 0 },
+        { id: anotherSession, name: "任务会话", historyCount: 0 },
+      ],
+      activeSessionId: SESSION,
+    });
+    render(<ChatWindow />);
+
+    await waitFor(() => {
+      expect(useAppStore.getState().sessionsByConnection[testBridge.id]).toContain(anotherSession);
+    });
+    useAppStore.getState().setSessionTaskState(testBridge.id, anotherSession, {
+      activeRequestId: "req-working",
+      phase: "working",
+      startedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      firstTokenAt: Date.now(),
+      stalledReason: null,
+    });
+
+    expect(screen.getByText("空闲")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /default/i }));
+    await waitFor(() => {
+      expect(screen.getByText("处理中")).toBeInTheDocument();
+    });
+  });
+
+  it("renders bridge buttons, supports custom input, and marks pending confirmation", async () => {
+    const user = userEvent.setup();
+    render(<ChatWindow />);
+    await waitFor(() => {
+      expect((eventHandlers.get("bridge-buttons")?.size ?? 0) > 0).toBe(true);
+    });
+    useAppStore.getState().addMessage(testBridge.id, SESSION, {
+      id: "bot-buttons-1",
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+      replyCtx: "ctx-1",
+      role: "bot",
+      content: "请选择处理方式",
+      contentType: "buttons",
+      buttons: [
+        [
+          { text: "允许", data: "perm:allow" },
+          { text: "拒绝", data: "perm:deny" },
+        ],
+      ],
+      timestamp: Date.now(),
+    });
+
+    emitMockEvent("bridge-buttons", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+      replyCtx: "ctx-1",
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("待确认")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "允许" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "拒绝" })).toBeInTheDocument();
+      expect(screen.getByPlaceholderText("输入自定义内容")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "发送自定义" })).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "允许" }));
+    expect(commands.sendCardAction).toHaveBeenCalledWith(
+      testBridge.id,
+      "perm:allow",
+      SESSION,
+      "ctx-1",
+    );
+
+    await user.type(screen.getByPlaceholderText("输入自定义内容"), "手动确认");
+    await user.click(screen.getByRole("button", { name: "发送自定义" }));
+    expect(commands.sendMessage).toHaveBeenCalledWith(
+      testBridge.id,
+      "手动确认",
+      SESSION,
+      "ctx-1",
+    );
+  });
+
+  it("does not mark stalled when timeout config is zero", () => {
+    vi.useFakeTimers();
+    render(<ChatWindow />);
+
+    useAppStore.getState().setSessionTaskState(testBridge.id, SESSION, {
+      activeRequestId: "req-zero",
+      phase: "thinking",
+      startedAt: Date.now() - 60_000,
+      lastActivityAt: Date.now() - 60_000,
+      firstTokenAt: null,
+      stalledReason: null,
+    });
+
+    vi.advanceTimersByTime(2_000);
+    expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("thinking");
+    expect(screen.queryByText(/可能卡住/i)).not.toBeInTheDocument();
+  });
+
+  it("marks session as stalled when timeout is enabled", () => {
+    vi.useFakeTimers();
+    useAppStore.setState({
+      config: {
+        bridges: [],
+        pet: {
+          size: 120,
+          alwaysOnTop: true,
+          chatWindowOpacity: 0.97,
+          chatWindowWidth: 480,
+          chatWindowHeight: 640,
+          toggleVisibilityShortcut: "Ctrl+Shift+H",
+          firstTokenTimeoutMs: 1000,
+          streamIdleTimeoutMs: 0,
+          appearance: {},
+        },
+        llm: {
+          apiUrl: "",
+          apiKey: "",
+          model: "",
+          enabled: false,
+        },
+      },
+    });
+    render(<ChatWindow />);
+
+    useAppStore.getState().setSessionTaskState(testBridge.id, SESSION, {
+      activeRequestId: "req-timeout",
+      phase: "thinking",
+      startedAt: Date.now() - 2_000,
+      lastActivityAt: Date.now() - 2_000,
+      firstTokenAt: null,
+      stalledReason: null,
+    });
+
+    vi.advanceTimersByTime(1_500);
+    expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("stalled");
+  });
+
+  it("keeps working during chunked bridge-message and completes after quiet debounce", async () => {
+    render(<ChatWindow />);
+    await Promise.resolve();
+    await Promise.resolve();
+    vi.useFakeTimers();
+
+    useAppStore.getState().setSessionTaskState(testBridge.id, SESSION, {
+      activeRequestId: "req-chunk",
+      phase: "thinking",
+      startedAt: Date.now(),
+      lastActivityAt: Date.now(),
+      firstTokenAt: null,
+      stalledReason: null,
+    });
+
+    emitMockEvent("bridge-message", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+      content: "part-1",
+    });
+    expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("working");
+
+    vi.advanceTimersByTime(800);
+    expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("working");
+
+    emitMockEvent("bridge-message", {
+      connectionId: testBridge.id,
+      sessionKey: SESSION,
+      content: "part-2",
+    });
+    vi.advanceTimersByTime(800);
+    expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("working");
+
+    vi.advanceTimersByTime(500);
+    expect(useAppStore.getState().getActiveSessionTaskState().phase).toBe("completed");
   });
 
   it("renders bot markdown links as preview cards", async () => {
@@ -319,5 +637,39 @@ describe("ChatWindow", () => {
     const target = links.find((item) => item.getAttribute("href") === "https://ziiimo.cn/h/ae4b");
     expect(target).toBeTruthy();
     expect(screen.getByText("（3小时有效）")).toBeInTheDocument();
+  });
+
+  it("does not mark chat titlebar as native drag region", () => {
+    render(<ChatWindow />);
+
+    expect(document.querySelector("[data-tauri-drag-region]")).toBeNull();
+  });
+
+  it("applies chat window opacity from config", () => {
+    useAppStore.setState({
+      config: {
+        bridges: [],
+        pet: {
+          size: 120,
+          alwaysOnTop: true,
+          chatWindowOpacity: 0.61,
+          chatWindowWidth: 480,
+          chatWindowHeight: 640,
+          toggleVisibilityShortcut: "Ctrl+Shift+H",
+          appearance: {},
+        },
+        llm: {
+          apiUrl: "",
+          apiKey: "",
+          model: "",
+          enabled: false,
+        },
+      },
+    });
+
+    render(<ChatWindow />);
+    expect(screen.getByTestId("chat-window-panel")).toHaveStyle({
+      backgroundColor: "rgba(255, 255, 255, 0.61)",
+    });
   });
 });

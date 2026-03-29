@@ -23,6 +23,17 @@ function formatTime(ts: number): string {
 
 const RECENT_VISIBLE = 2;
 
+function formatSessionPhase(phase?: string): string {
+  if (!phase || phase === "idle") return "空闲";
+  if (phase === "thinking") return "思考中";
+  if (phase === "working") return "处理中";
+  if (phase === "awaiting_confirmation") return "待确认";
+  if (phase === "completed") return "已完成";
+  if (phase === "failed") return "失败";
+  if (phase === "stalled") return "可能卡住";
+  return "空闲";
+}
+
 export function SessionDropdown() {
   const {
     connections,
@@ -39,6 +50,7 @@ export function SessionDropdown() {
     clearSessionUnread,
     removeSession,
     hasAnyUnread,
+    sessionTaskStateByConnection,
   } = useAppStore();
   const [open, setOpen] = useState(false);
   const [showAll, setShowAll] = useState(false);
@@ -80,6 +92,7 @@ export function SessionDropdown() {
   const lastActive = sessionLastActiveByConnection[activeConnectionId] ?? {};
   const unread = sessionUnreadByConnection[activeConnectionId] ?? {};
   const hasUnread = hasAnyUnread();
+  const taskBySession = sessionTaskStateByConnection[activeConnectionId] ?? {};
   const totalUnread = Object.values(sessionUnreadByConnection).reduce(
     (sum, bySession) => sum + Object.values(bySession).reduce((n, c) => n + c, 0),
     0
@@ -92,6 +105,9 @@ export function SessionDropdown() {
   const buttonLabel = bridgeList.length > 1
     ? `${activeConnectionName}${activeLabel ? ` · ${activeLabel}` : ""}`
     : (activeLabel ?? activeConnectionName);
+  const activeStatusLabel = formatSessionPhase(
+    activeSessionKey ? taskBySession[activeSessionKey]?.phase : "idle",
+  );
 
   const inactive = allSessions
     .filter((sid) => sid !== activeSessionKey)
@@ -206,6 +222,7 @@ export function SessionDropdown() {
         <span className="text-[12px] font-semibold text-gray-800 truncate">
           {buttonLabel}
         </span>
+        <span className="text-[10px] text-gray-500 flex-shrink-0">{activeStatusLabel}</span>
         {hasUnread && (
           <span className="inline-flex min-w-4 h-4 px-1 items-center justify-center rounded-full bg-red-500 text-white text-[9px] font-semibold leading-none flex-shrink-0">
             {formatUnread(totalUnread)}
@@ -262,6 +279,9 @@ export function SessionDropdown() {
                   <span className="text-[11px] text-indigo-700 font-medium truncate flex-1">
                     {activeLabel ?? "—"}
                   </span>
+                  <span className="text-[10px] text-indigo-500 flex-shrink-0">
+                    {activeStatusLabel}
+                  </span>
                   {activeSessionKey && (unread[activeSessionKey] ?? 0) > 0 && (
                     <span className="inline-flex min-w-4 h-4 px-1 items-center justify-center rounded-full bg-red-500 text-white text-[9px] font-semibold leading-none flex-shrink-0">
                       {formatUnread(unread[activeSessionKey] ?? 0)}
@@ -292,6 +312,9 @@ export function SessionDropdown() {
                       <span className="w-1.5 h-1.5 rounded-full bg-gray-300 flex-shrink-0" />
                       <span className="text-[11px] text-gray-600 truncate flex-1">
                         {sessionLabelText(sid)}
+                      </span>
+                      <span className="text-[10px] text-gray-500 flex-shrink-0">
+                        {formatSessionPhase(taskBySession[sid]?.phase)}
                       </span>
                       {(unread[sid] ?? 0) > 0 && (
                         <span className="inline-flex min-w-4 h-4 px-1 items-center justify-center rounded-full bg-red-500 text-white text-[9px] font-semibold leading-none flex-shrink-0">

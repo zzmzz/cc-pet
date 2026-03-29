@@ -11,13 +11,31 @@ import {
   loadConfig,
   saveConfig,
   connectBridge,
+  startSshTunnel,
   getBridgeStatus,
   setMainWindowSize,
   listLocalSessions,
   getHistory,
 } from "@/lib/commands";
+import type { AppConfig } from "@/lib/types";
 
 let hasInitializedApp = false;
+
+export async function initializeBridgeConnections(cfg: AppConfig): Promise<void> {
+  for (const bridge of cfg.bridges ?? []) {
+    if (!bridge.token?.trim()) {
+      continue;
+    }
+    if (bridge.sshTunnel?.enabled) {
+      try {
+        await startSshTunnel(bridge.id, bridge.sshTunnel);
+      } catch (err) {
+        console.error(`[tunnel] auto start failed for ${bridge.id}:`, err);
+      }
+    }
+    connectBridge(bridge.id).catch(console.error);
+  }
+}
 
 export default function App() {
   const {
@@ -76,11 +94,7 @@ export default function App() {
             .catch((e) => console.error("[sessions] listLocalSessions failed:", e));
         }
 
-        for (const bridge of cfg.bridges ?? []) {
-          if (bridge.token?.trim()) {
-            connectBridge(bridge.id).catch(console.error);
-          }
-        }
+        await initializeBridgeConnections(cfg);
         if (!cfg.bridges?.length) {
           setSettingsOpen(true);
         }

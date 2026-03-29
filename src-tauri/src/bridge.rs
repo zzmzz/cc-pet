@@ -20,6 +20,11 @@ pub enum BridgeCommand {
         session_key: Option<String>,
         reply_ctx: Option<String>,
     },
+    SendCardAction {
+        action: String,
+        session_key: Option<String>,
+        reply_ctx: Option<String>,
+    },
     Stop,
 }
 
@@ -75,6 +80,22 @@ impl BridgeClient {
         self.tx
             .send(BridgeCommand::SendFile {
                 path,
+                session_key,
+                reply_ctx,
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn send_card_action(
+        &self,
+        action: String,
+        session_key: Option<String>,
+        reply_ctx: Option<String>,
+    ) -> Result<(), String> {
+        self.tx
+            .send(BridgeCommand::SendCardAction {
+                action,
                 session_key,
                 reply_ctx,
             })
@@ -139,7 +160,7 @@ fn make_register(platform: &str) -> String {
     json!({
         "type": "register",
         "platform": platform,
-        "capabilities": ["text", "buttons", "file"],
+        "capabilities": ["text", "buttons", "file", "typing", "update_message", "preview"],
         "metadata": {
             "version": "0.5.0",
             "protocol_version": 1,
@@ -323,6 +344,29 @@ fn make_file_message(
     .to_string())
 }
 
+fn make_card_action(
+    action: &str,
+    cfg: &BridgeConfig,
+    session_key: Option<&str>,
+    reply_ctx: Option<&str>,
+) -> String {
+    let session_key = session_key
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| default_session_key(cfg));
+    let reply_ctx = reply_ctx
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| default_reply_ctx(cfg));
+    json!({
+        "type": "card_action",
+        "session_key": session_key,
+        "action": action,
+        "reply_ctx": reply_ctx,
+    })
+    .to_string()
+}
+
 fn make_ping() -> String {
     json!({
         "type": "ping",
@@ -445,6 +489,18 @@ async fn bridge_loop(
                                                     json!({ "connectionId": connection_id2, "error": format!("File send failed: {e}") }),
                                                 );
                                             }
+                                        }
+                                    }
+                                    Some(BridgeCommand::SendCardAction { action, session_key, reply_ctx }) => {
+                                        let msg = make_card_action(
+                                            &action,
+                                            &cfg2,
+                                            session_key.as_deref(),
+                                            reply_ctx.as_deref(),
+                                        );
+                                        if write.send(Message::Text(msg.into())).await.is_err() {
+                                            eprintln!("[bridge:{client_id}] send card_action failed; disconnected");
+                                            return SendLoopExit::Disconnected;
                                         }
                                     }
                                     Some(BridgeCommand::Stop) | None => {
@@ -683,16 +739,92 @@ async fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle
                         eprintln!("[bridge] failed to save buttons to history: {e}");
                     }
                     let _ = app.emit(
-                        "bridge-message",
+                        "bridge-buttons",
                         json!({
                             "connectionId": connection_id,
                             "sessionKey": session_key,
                             "replyCtx": reply_ctx,
-                            "content": content
+                            "content": content,
+                            "buttons": val.get("buttons").cloned().unwrap_or_else(|| json!([])),
                         }),
                     );
                 }
             }
+        }
+        "typing_start" => {
+            let _ = app.emit(
+                "bridge-typing-start",
+                json!({
+                    "connectionId": connection_id,
+                    "sessionKey": session_key,
+                    "replyCtx": reply_ctx,
+                }),
+            );
+        }
+        "typing_stop" => {
+            let _ = app.emit(
+                "bridge-typing-stop",
+                json!({
+                    "connectionId": connection_id,
+                    "sessionKey": session_key,
+                    "replyCtx": reply_ctx,
+                }),
+            );
+        }
+        "preview_start" => {
+            let content = val
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ref_id = val
+                .get("ref_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let _ = app.emit(
+                "bridge-preview-start",
+                json!({
+                    "connectionId": connection_id,
+                    "sessionKey": session_key,
+                    "replyCtx": reply_ctx,
+                    "content": content,
+                    "refId": ref_id,
+                }),
+            );
+        }
+        "update_message" => {
+            let content = val
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let preview_handle = val
+                .get("preview_handle")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let _ = app.emit(
+                "bridge-preview-update",
+                json!({
+                    "connectionId": connection_id,
+                    "sessionKey": session_key,
+                    "replyCtx": reply_ctx,
+                    "previewHandle": preview_handle,
+                    "content": content,
+                }),
+            );
+        }
+        "delete_message" => {
+            let preview_handle = val
+                .get("preview_handle")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let _ = app.emit(
+                "bridge-preview-delete",
+                json!({
+                    "connectionId": connection_id,
+                    "sessionKey": session_key,
+                    "replyCtx": reply_ctx,
+                    "previewHandle": preview_handle,
+                }),
+            );
         }
         "error" => {
             let msg = val
@@ -761,6 +893,7 @@ mod tests {
             token: "test-token:&$".to_string(),
             platform_name: "desktop-pet".to_string(),
             user_id: "pet-user".to_string(),
+            ssh_tunnel: None,
         }
     }
 
@@ -817,7 +950,7 @@ mod tests {
             .iter()
             .filter_map(|x| x.as_str())
             .collect();
-        for need in ["text", "buttons", "file"] {
+        for need in ["text", "buttons", "file", "typing", "update_message", "preview"] {
             assert!(caps.contains(need), "missing capability {need:?}");
         }
         let meta = v["metadata"].as_object().expect("metadata object");

@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { clearHistory, fetchLinkPreview, getHistory, sendMessage, setWindowOpacity } from "./commands";
+import {
+  clearHistory,
+  fetchLinkPreview,
+  getHistory,
+  sendMessage,
+  setWindowOpacity,
+  togglePetVisibility,
+} from "./commands";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -50,5 +57,10 @@ describe("commands wrappers", () => {
     expect(invoke).toHaveBeenCalledWith("fetch_link_preview", {
       url: "https://ziiimo.cn/f/ce29",
     });
+  });
+
+  it("maps togglePetVisibility to toggle_window_visibility invoke", async () => {
+    await togglePetVisibility();
+    expect(invoke).toHaveBeenCalledWith("toggle_window_visibility");
   });
 });
