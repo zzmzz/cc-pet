@@ -4,6 +4,7 @@ import { useAppStore, makeChatKey } from "@/lib/store";
 import { runManualUpdateCheckWithDialogs } from "@/lib/manualUpdateCheck";
 import { listBridgeSessions, getHistory } from "@/lib/commands";
 import { resolveIncomingSessionKey } from "@/lib/sessionRouting";
+import type { SlashCommand } from "@/components/SlashCommandMenu";
 
 export function useTauriEvents() {
   const {
@@ -18,6 +19,7 @@ export function useTauriEvents() {
     setChatOpen,
     setSettingsOpen,
     markSessionUnread,
+    setAgentCommands,
   } = useAppStore();
 
   useEffect(() => {
@@ -207,6 +209,17 @@ export function useTauriEvents() {
       );
       if (cancelled) { u3(); return; }
       unlistenFns.push(u3);
+
+      const u3b = await listen<{ connectionId: string; commands?: SlashCommand[] }>(
+        "bridge-skills-updated",
+        (e) => {
+          if (cancelled) return;
+          const commands = Array.isArray(e.payload.commands) ? e.payload.commands : [];
+          setAgentCommands(commands);
+        }
+      );
+      if (cancelled) { u3b(); return; }
+      unlistenFns.push(u3b);
       
       const u4 = await listen("toggle-chat", () => {
         if (cancelled) return;
@@ -236,5 +249,5 @@ export function useTauriEvents() {
       cancelled = true;
       unlistenFns.forEach((fn) => fn());
     };
-  }, [setConnectionStatus, setPetState, addMessage, ensureSession, setActiveSessionKey, setSessions, setSessionLabel, setMessages, setChatOpen, setSettingsOpen, markSessionUnread]);
+  }, [setConnectionStatus, setPetState, addMessage, ensureSession, setActiveSessionKey, setSessions, setSessionLabel, setMessages, setChatOpen, setSettingsOpen, markSessionUnread, setAgentCommands]);
 }

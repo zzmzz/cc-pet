@@ -1036,6 +1036,31 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || !activeConnectionId || !activeSessionKey) return;
+    const runLocalCommand = async (): Promise<boolean> => {
+      switch (text) {
+        case "/clear":
+          clearHistory(activeConnectionId).catch(console.error);
+          clearMessages(activeConnectionId, activeSessionKey);
+          clearSessionTaskState(activeConnectionId, activeSessionKey);
+          return true;
+        case "/settings":
+          setSettingsOpen(true);
+          return true;
+        case "/connect":
+          connectBridge(activeConnectionId).catch(console.error);
+          return true;
+        case "/disconnect":
+          disconnectBridge(activeConnectionId).catch(console.error);
+          return true;
+        default:
+          return false;
+      }
+    };
+    if (await runLocalCommand()) {
+      setInput("");
+      inputRef.current?.focus();
+      return;
+    }
     setInput("");
 
     const userMsg: ChatMessage = {
@@ -1063,6 +1088,9 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
     addMessage,
     beginSessionRequest,
     markSessionFailed,
+    clearMessages,
+    clearSessionTaskState,
+    setSettingsOpen,
   ]);
 
   const handleAttach = useCallback(async () => {
@@ -1129,91 +1157,44 @@ export function ChatWindow({ petSize = 120 }: { petSize?: number }) {
 
   const handleSlashSelect = useCallback(
     async (cmd: SlashCommand) => {
-      setInput("");
+      setInput(cmd.command + " ");
       setSlashIndex(0);
-
-      if (cmd.type === "local") {
-        switch (cmd.command) {
-          case "/clear":
-            if (activeConnectionId && activeSessionKey) {
-              clearHistory(activeConnectionId).catch(console.error);
-              clearMessages(activeConnectionId, activeSessionKey);
-              clearSessionTaskState(activeConnectionId, activeSessionKey);
-            }
-            break;
-          case "/settings":
-            setSettingsOpen(true);
-            break;
-          case "/connect":
-            if (activeConnectionId) connectBridge(activeConnectionId).catch(console.error);
-            break;
-          case "/disconnect":
-            if (activeConnectionId) disconnectBridge(activeConnectionId).catch(console.error);
-            break;
-        }
-      } else if (activeConnectionId && activeSessionKey) {
-        const userMsg: ChatMessage = {
-          id: `user-${Date.now()}`,
-          connectionId: activeConnectionId,
-          sessionKey: activeSessionKey,
-          role: "user",
-          content: cmd.command,
-          contentType: "text",
-          timestamp: Date.now(),
-        };
-        addMessage(activeConnectionId, activeSessionKey, userMsg);
-        beginSessionRequest(activeConnectionId, activeSessionKey);
-        try {
-          await sendMessage(activeConnectionId, cmd.command, activeSessionKey);
-        } catch (e) {
-          console.error("send failed:", e);
-          markSessionFailed(activeConnectionId, activeSessionKey);
-        }
-      }
-
       inputRef.current?.focus();
     },
-    [
-      activeConnectionId,
-      activeSessionKey,
-      addMessage,
-      beginSessionRequest,
-      markSessionFailed,
-      clearMessages,
-      clearSessionTaskState,
-      setSettingsOpen,
-    ]
+    []
   );
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (slashMenuVisible) {
         const filtered = getFilteredCommands(slashQuery, agentCommands);
-        if (e.key === "ArrowDown") {
+        const slashMenuInteractive = filtered.length > 0 && !slashQuery.includes(" ");
+        if (slashMenuInteractive && e.key === "ArrowDown") {
           e.preventDefault();
           setSlashIndex((prev) => (prev + 1) % filtered.length);
           return;
         }
-        if (e.key === "ArrowUp") {
+        if (slashMenuInteractive && e.key === "ArrowUp") {
           e.preventDefault();
           setSlashIndex((prev) => (prev - 1 + filtered.length) % filtered.length);
           return;
         }
-        if (e.key === "Enter") {
+        if (slashMenuInteractive && e.key === "Enter") {
           e.preventDefault();
           if (filtered[slashIndex]) {
-            handleSlashSelect(filtered[slashIndex]);
+            setInput(filtered[slashIndex].command + " ");
+            setSlashIndex(0);
           }
           return;
         }
-        if (e.key === "Tab") {
+        if (slashMenuInteractive && e.key === "Tab") {
           e.preventDefault();
           if (filtered[slashIndex]) {
             setInput(filtered[slashIndex].command + " ");
           }
           return;
         }
-        if (e.key === "Escape") {
+        if (slashMenuInteractive && e.key === "Escape") {
           e.preventDefault();
           setInput("");
           return;

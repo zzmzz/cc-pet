@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 
-export type CommandCategory = "builtin" | "session" | "agent" | "dir" | "cron" | "other";
+export type CommandCategory = "builtin" | "session" | "agent" | "dir" | "cron" | "skill" | "other";
 
 export interface SlashCommand {
   command: string;
@@ -56,6 +56,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   agent: "Agent 控制",
   dir: "工作目录",
   cron: "定时任务",
+  skill: "Skills",
   other: "其他",
 };
 

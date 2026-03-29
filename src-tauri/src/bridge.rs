@@ -25,6 +25,7 @@ pub enum BridgeCommand {
         session_key: Option<String>,
         reply_ctx: Option<String>,
     },
+    ProbeSkills,
     Stop,
 }
 
@@ -40,16 +41,89 @@ enum SendLoopExit {
     Disconnected,
 }
 
+const SKILLS_PROBE_REPLY_CTX: &str = "__cc_pet_skills_probe__";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedSkillCommand {
+    command: String,
+    description: String,
+}
+
+fn parse_skill_commands_from_text(text: &str) -> Vec<ParsedSkillCommand> {
+    let mut out: Vec<ParsedSkillCommand> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('/') {
+            continue;
+        }
+        let command_token = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim();
+        if command_token.len() <= 1
+            || command_token.contains('<')
+            || command_token.contains('>')
+            || command_token.contains('[')
+            || command_token.contains(']')
+        {
+            continue;
+        }
+        let rest = trimmed[command_token.len()..].trim();
+        let description = rest
+            .trim_start_matches(|c: char| c == '—' || c == '–' || c == '-' || c == ':')
+            .trim();
+        if description.is_empty() {
+            continue;
+        }
+        let key = command_token.to_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(ParsedSkillCommand {
+            command: command_token.to_string(),
+            description: description.to_string(),
+        });
+    }
+
+    out
+}
+
+fn emit_skills_update(app: &tauri::AppHandle, connection_id: &str, content: &str) {
+    let skills = parse_skill_commands_from_text(content);
+    let commands: Vec<Value> = skills
+        .into_iter()
+        .map(|s| {
+            json!({
+                "command": s.command,
+                "description": s.description,
+                "category": "skill",
+                "type": "send"
+            })
+        })
+        .collect();
+    let _ = app.emit(
+        "bridge-skills-updated",
+        json!({
+            "connectionId": connection_id,
+            "commands": commands
+        }),
+    );
+}
+
 impl BridgeClient {
     pub fn start(connection_id: String, cfg: BridgeConfig, app: tauri::AppHandle, history: ChatHistory) -> Self {
         let (tx, rx) = mpsc::channel::<BridgeCommand>(64);
         let rx = Arc::new(Mutex::new(rx));
+        let tx_for_loop = tx.clone();
         let client_id = CLIENT_SEQ.fetch_add(1, Ordering::Relaxed);
         let connected = Arc::new(AtomicBool::new(false));
         let connected_for_loop = connected.clone();
 
         tokio::spawn(async move {
-            bridge_loop(connection_id, cfg, app, rx, client_id, connected_for_loop, history).await;
+            bridge_loop(connection_id, cfg, app, tx_for_loop, rx, client_id, connected_for_loop, history).await;
         });
 
         Self { tx, connected }
@@ -415,6 +489,7 @@ async fn bridge_loop(
     connection_id: String,
     cfg: BridgeConfig,
     app: tauri::AppHandle,
+    tx: mpsc::Sender<BridgeCommand>,
     rx: Arc<Mutex<mpsc::Receiver<BridgeCommand>>>,
     client_id: u64,
     connected: Arc<AtomicBool>,
@@ -503,6 +578,18 @@ async fn bridge_loop(
                                             return SendLoopExit::Disconnected;
                                         }
                                     }
+                                    Some(BridgeCommand::ProbeSkills) => {
+                                        let msg = make_message(
+                                            "/skills",
+                                            &cfg2,
+                                            None,
+                                            Some(SKILLS_PROBE_REPLY_CTX),
+                                        );
+                                        if write.send(Message::Text(msg.into())).await.is_err() {
+                                            eprintln!("[bridge:{client_id}] send probe /skills failed; disconnected");
+                                            return SendLoopExit::Disconnected;
+                                        }
+                                    }
                                     Some(BridgeCommand::Stop) | None => {
                                         eprintln!("[bridge:{client_id}] stop received");
                                         return SendLoopExit::Stopped;
@@ -524,6 +611,7 @@ async fn bridge_loop(
                 let connected_for_recv = connected.clone();
                 let connection_id3 = connection_id.clone();
                 let history3 = history.clone();
+                let tx3 = tx.clone();
                 let recv_handle = tokio::spawn(async move {
                     while let Some(Ok(msg)) = read.next().await {
                         if let Message::Text(text) = msg {
@@ -534,6 +622,7 @@ async fn bridge_loop(
                                     && val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false)
                                 {
                                     connected_for_recv.store(true, Ordering::Relaxed);
+                                    let _ = tx3.send(BridgeCommand::ProbeSkills).await;
                                 }
                                 handle_message(&connection_id3, &val, &app3, &history3).await;
                             }
@@ -626,6 +715,10 @@ async fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle
                 .or_else(|| val.get("message").and_then(|v| v.as_str()))
             {
                 if !content.is_empty() {
+                    if reply_ctx == SKILLS_PROBE_REPLY_CTX {
+                        emit_skills_update(app, connection_id, content);
+                        return;
+                    }
                     // Save to history
                     let msg = ChatMessage {
                         id: format!("bot-{}", chrono::Utc::now().timestamp_millis()),
@@ -668,6 +761,10 @@ async fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle
                             .map(|s| s.to_string())
                     });
                 if let Some(text) = full.filter(|s| !s.is_empty()) {
+                    if reply_ctx == SKILLS_PROBE_REPLY_CTX {
+                        emit_skills_update(app, connection_id, &text);
+                        return;
+                    }
                     eprintln!("[bridge] emit bridge-stream-done len={}", text.len());
                     // Save to history
                     let msg = ChatMessage {
@@ -706,6 +803,9 @@ async fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle
                 }
                 handle_attachments(connection_id, &session_key, &reply_ctx, val, app, history).await;
             } else if let Some(chunk) = reply_stream_chunk(val) {
+                if reply_ctx == SKILLS_PROBE_REPLY_CTX {
+                    return;
+                }
                 if !chunk.is_empty() {
                     eprintln!("[bridge] emit bridge-stream-delta len={}", chunk.len());
                     let _ = app.emit(
@@ -844,6 +944,10 @@ async fn handle_message(connection_id: &str, val: &Value, app: &tauri::AppHandle
                 .or_else(|| val.get("text").and_then(|v| v.as_str()))
             {
                 if !content.is_empty() {
+                    if reply_ctx == SKILLS_PROBE_REPLY_CTX {
+                        emit_skills_update(app, connection_id, content);
+                        return;
+                    }
                     eprintln!("[bridge] emit bridge-message (no type) len={}", content.len());
                     // Save to history
                     let msg = ChatMessage {
@@ -1052,5 +1156,25 @@ mod tests {
             Some("desktop-pet:user-a:room-42")
         );
         assert_eq!(v.get("reply_ctx").and_then(|x| x.as_str()), Some("ctx-room-42"));
+    }
+
+    #[test]
+    fn parse_skill_commands_from_text_extracts_commands() {
+        let text = "📋 Available Skills (codex) — 2 skill(s)\n\n  /deploy-prod — Deploy project to production\n  /daily-report — Generate daily report\n\nUsage: /<skill-name> [args...]";
+        let cmds = parse_skill_commands_from_text(text);
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].command, "/deploy-prod");
+        assert_eq!(cmds[0].description, "Deploy project to production");
+        assert_eq!(cmds[1].command, "/daily-report");
+        assert_eq!(cmds[1].description, "Generate daily report");
+    }
+
+    #[test]
+    fn parse_skill_commands_from_text_supports_chinese_hint_lines() {
+        let text = "📋 可用 Skills\n  /日报总结 — 生成日报\n  /发布_预发 — 发布到预发环境\n\n用法：/<skill名称> [参数...]";
+        let cmds = parse_skill_commands_from_text(text);
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].command, "/日报总结");
+        assert_eq!(cmds[1].command, "/发布_预发");
     }
 }

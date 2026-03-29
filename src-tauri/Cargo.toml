@@ -1,6 +1,6 @@
 [package]
 name = "cc-pet"
-version = "1.3.3"
+version = "1.3.4"
 edition = "2021"
 description = "Desktop pet connecting to cc-connect via Bridge WebSocket"
 license = "MIT"
