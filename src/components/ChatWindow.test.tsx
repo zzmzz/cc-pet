@@ -424,6 +424,7 @@ describe("ChatWindow", () => {
         pet: {
           size: 120,
           alwaysOnTop: true,
+          launchOnStartup: false,
           chatWindowOpacity: 0.97,
           chatWindowWidth: 480,
           chatWindowHeight: 640,
@@ -794,6 +795,7 @@ describe("ChatWindow", () => {
         pet: {
           size: 120,
           alwaysOnTop: true,
+          launchOnStartup: false,
           chatWindowOpacity: 0.61,
           chatWindowWidth: 480,
           chatWindowHeight: 640,

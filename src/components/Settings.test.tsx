@@ -50,6 +50,7 @@ const baseConfig: AppConfig = {
   pet: {
     size: 120,
     alwaysOnTop: true,
+    launchOnStartup: false,
     chatWindowOpacity: 0.95,
     chatWindowWidth: 480,
     chatWindowHeight: 640,

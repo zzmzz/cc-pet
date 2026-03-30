@@ -65,6 +65,8 @@ pub struct PetAppearanceConfig {
 pub struct PetConfig {
     pub size: u32,
     pub always_on_top: bool,
+    #[serde(default)]
+    pub launch_on_startup: bool,
     pub chat_window_opacity: f64,
     #[serde(default = "default_chat_window_width")]
     pub chat_window_width: f64,
@@ -157,6 +159,7 @@ struct TomlBridgeLegacy {
 struct TomlPet {
     size: Option<u32>,
     always_on_top: Option<bool>,
+    launch_on_startup: Option<bool>,
     chat_window_opacity: Option<f64>,
     chat_window_width: Option<f64>,
     chat_window_height: Option<f64>,
@@ -206,6 +209,7 @@ fn parse_pet_and_llm(pet_opt: Option<TomlPet>, llm_opt: Option<TomlLlm>) -> (Pet
     let pet = pet_opt.unwrap_or(TomlPet {
         size: None,
         always_on_top: None,
+        launch_on_startup: None,
         chat_window_opacity: None,
         chat_window_width: None,
         chat_window_height: None,
@@ -231,6 +235,7 @@ fn parse_pet_and_llm(pet_opt: Option<TomlPet>, llm_opt: Option<TomlLlm>) -> (Pet
         PetConfig {
             size: pet.size.unwrap_or(120),
             always_on_top: pet.always_on_top.unwrap_or(true),
+            launch_on_startup: pet.launch_on_startup.unwrap_or(false),
             chat_window_opacity: pet.chat_window_opacity.unwrap_or(0.95),
             chat_window_width: pet.chat_window_width.unwrap_or(480.0),
             chat_window_height: pet.chat_window_height.unwrap_or(640.0),
@@ -429,6 +434,7 @@ user_id = "{}"
         r#"{}[pet]
 size = {}
 always_on_top = {}
+launch_on_startup = {}
 chat_window_opacity = {}
 chat_window_width = {}
 chat_window_height = {}{}
@@ -444,6 +450,7 @@ enabled = {}
         bridges_block,
         config.pet.size,
         config.pet.always_on_top,
+        config.pet.launch_on_startup,
         config.pet.chat_window_opacity,
         config.pet.chat_window_width,
         config.pet.chat_window_height,
@@ -465,6 +472,7 @@ fn default_config() -> AppConfig {
         pet: PetConfig {
             size: 120,
             always_on_top: true,
+            launch_on_startup: false,
             chat_window_opacity: 0.95,
             chat_window_width: 480.0,
             chat_window_height: 640.0,
@@ -499,6 +507,7 @@ mod tests {
         let (pet, llm) = parse_pet_and_llm(None, None);
         assert_eq!(pet.size, 120);
         assert!(pet.always_on_top);
+        assert!(!pet.launch_on_startup);
         assert!((pet.chat_window_opacity - 0.95).abs() < f64::EPSILON);
         assert!((pet.chat_window_width - 480.0).abs() < f64::EPSILON);
         assert!((pet.chat_window_height - 640.0).abs() < f64::EPSILON);
@@ -513,6 +522,7 @@ mod tests {
         let pet = TomlPet {
             size: None,
             always_on_top: None,
+            launch_on_startup: None,
             chat_window_opacity: None,
             chat_window_width: None,
             chat_window_height: None,
@@ -531,5 +541,21 @@ mod tests {
         assert!(pet_cfg.appearance.talking.is_none());
         assert!(pet_cfg.appearance.happy.is_none());
         assert!(pet_cfg.appearance.error.is_none());
+    }
+
+    #[test]
+    fn parse_pet_and_llm_reads_launch_on_startup_flag() {
+        let pet = TomlPet {
+            size: None,
+            always_on_top: None,
+            launch_on_startup: Some(true),
+            chat_window_opacity: None,
+            chat_window_width: None,
+            chat_window_height: None,
+            toggle_visibility_shortcut: None,
+            appearance: None,
+        };
+        let (pet_cfg, _) = parse_pet_and_llm(Some(pet), None);
+        assert!(pet_cfg.launch_on_startup);
     }
 }

@@ -26,7 +26,14 @@ function makeId(): string {
 
 function normalizeBridges(config: AppConfig): AppConfig {
   const bridges = Array.isArray(config.bridges) ? config.bridges : [];
-  return { ...config, bridges };
+  return {
+    ...config,
+    bridges,
+    pet: {
+      ...config.pet,
+      launchOnStartup: Boolean(config.pet.launchOnStartup),
+    },
+  };
 }
 
 function createBridge(): BridgeConfig {
@@ -567,6 +574,24 @@ export function Settings() {
                       <span
                         className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${
                           form.pet.alwaysOnTop ? "translate-x-5" : ""
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm text-gray-600">开机自启动</label>
+                    <button
+                      onClick={() =>
+                        update("pet.launchOnStartup", !form.pet.launchOnStartup)
+                      }
+                      className={`relative w-11 h-6 rounded-full transition-colors ${
+                        form.pet.launchOnStartup ? "bg-indigo-500" : "bg-gray-300"
+                      }`}
+                    >
+                      <span
+                        className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${
+                          form.pet.launchOnStartup ? "translate-x-5" : ""
                         }`}
                       />
                     </button>

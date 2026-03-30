@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, LogicalSize, Manager, Size};
+use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
@@ -392,8 +393,23 @@ async fn save_config(
 ) -> Result<(), String> {
     let shortcut = apply_toggle_shortcut(&app, state.inner(), &config.pet.toggle_visibility_shortcut)?;
     config.pet.toggle_visibility_shortcut = shortcut;
+    apply_launch_on_startup(&app, config.pet.launch_on_startup)?;
     config::save_config(&config)?;
     *state.config.lock().await = config;
+    Ok(())
+}
+
+fn apply_launch_on_startup(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    let autolaunch = app.autolaunch();
+    if enabled {
+        autolaunch
+            .enable()
+            .map_err(|e| format!("enable autostart failed: {e}"))?;
+    } else {
+        autolaunch
+            .disable()
+            .map_err(|e| format!("disable autostart failed: {e}"))?;
+    }
     Ok(())
 }
 
@@ -1172,6 +1188,7 @@ pub fn run() {
         pet: config::PetConfig {
             size: 120,
             always_on_top: true,
+            launch_on_startup: false,
             chat_window_opacity: 0.95,
             chat_window_width: 480.0,
             chat_window_height: 640.0,
@@ -1201,6 +1218,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler({
@@ -1251,6 +1272,10 @@ pub fn run() {
                 let _ = win.center();
                 let _ = win.show();
                 let _ = win.set_focus();
+            }
+
+            if let Err(err) = apply_launch_on_startup(&app.handle(), cfg.pet.launch_on_startup) {
+                eprintln!("failed to apply launch on startup: {err}");
             }
 
             Ok(())

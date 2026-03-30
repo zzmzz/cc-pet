@@ -89,6 +89,7 @@ export interface PetAppearance {
 export interface PetConfig {
   size: number;
   alwaysOnTop: boolean;
+  launchOnStartup: boolean;
   chatWindowOpacity: number;
   chatWindowWidth: number;
   chatWindowHeight: number;
